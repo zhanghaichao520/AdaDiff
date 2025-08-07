@@ -1,0 +1,54 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# VSCode settings
+.vscode/
+
+# Environment files
+.env
+.venv/
+*.egg-info/
+*.log
+
+# Model checkpoints
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.h5
+*.npz
+
+# HuggingFace transformers cache
+cache/
+*.cache
+*.tokenizer
+*.model
+
+# Datasets and outputs
+datasets/
+data/
+output/
+results/
+logs/
+*.npy
+*.jsonl
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*.DS_Store
+
+# Compiled files
+build/
+dist/
+*.egg-info/
+
+# System files
+Thumbs.db
+ehthumbs.db
