@@ -1,5 +1,5 @@
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=2
 python amazon_text_emb.py --dataset Baby \
-    --model_name_or_path /data/jwna230/peiyu/LLM-Models/Qwen/Qwen3-Embedding-8B \
+    --model_name_or_path /mnt/disk9T/zj/projects/peiyu/LLM_Models/Qwen/Qwen3-Embedding-8B \
     --plm_name qwen
