@@ -12,7 +12,7 @@ OUTPUT_PATH="../datasets"
 GPU_ID="1"
 MODEL_PATH="/data/jwna230/peiyu/LLM-Models/Qwen/Qwen3-Embedding-8B"
 PLM_NAME="qwen"
-IMAGE_ROOT="../datasets/amazon18/Images"
+IMAGE_ROOT="../datasets/amazon14/Images"
 MODEL_CACHE_DIR="../cache_models/clip"
 
 # Function to print usage
