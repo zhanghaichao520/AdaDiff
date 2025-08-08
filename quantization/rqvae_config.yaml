@@ -1,0 +1,24 @@
+dataset:
+  name: "Beauty"
+  max_items_per_seq: 128
+  type: "AmazonReviews2014"
+  features_needed: ["title", "brand", "categories", "description"]
+  prompt_format: "v1"
+
+
+RQ-VAE:
+  input_dim: 512 
+  hidden_dim: [1024, 512]
+  latent_dim: 256
+  num_layers: 3
+  code_book_size: 2048
+  dropout: 0.0
+  beta: 0.25
+  epochs: 5000
+  batch_size: 4096
+  optimizer: "AdamW"
+  lr: 0.001
+  weight_decay: 0.0
+  
+training:
+  device: "cuda:0"
