@@ -1,0 +1,19 @@
+{
+  "start_time": "2025-08-09T21:02:35.624188",
+  "restarts": [],
+  "current_run": 0,
+  "used_ports": [
+    "36321"
+  ],
+  "world_size": 4,
+  "node_rank": 0,
+  "master_addr": "127.0.0.1",
+  "original_args": [
+    "/data/jwna230/peiyu/GenRec/MM-RQVAE/autoregression/src/train.py",
+    "experiment=tiger_train_flat",
+    "data_dir=../datasets/Baby",
+    "semantic_id_path=../datasets/Baby/codebook.pt",
+    "num_hierarchies=4",
+    "++should_skip_retry=True"
+  ]
+}

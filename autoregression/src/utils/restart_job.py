@@ -17,7 +17,6 @@ from src.utils.pylogger import RankedLogger
 from src.utils.restart_job_utils import (
     JobCheckpointMetadata,
     RestartMetadata,
-    _copy_time_dependent_args,
     _is_process_running,
     clean_up_resources,
     get_attribute_from_metadata_file,

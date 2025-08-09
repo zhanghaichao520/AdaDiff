@@ -1,0 +1,23 @@
+{
+  "start_time": "2025-08-09T01:48:03.738380",
+  "restarts": [
+    {
+      "time": "2025-08-09T01:51:42.502223",
+      "exception": "DataLoader timed out after 60 seconds",
+      "run_number": 0
+    }
+  ],
+  "current_run": 1,
+  "used_ports": [],
+  "world_size": 0,
+  "node_rank": 0,
+  "master_addr": "",
+  "original_args": [
+    "/data/jwna230/peiyu/GenRec/MM-RQVAE/autoregression/src/train.py",
+    "experiment=tiger_train_flat",
+    "data_dir=../datasets/Baby",
+    "semantic_id_path=../datasets/Baby/codebook.pt",
+    "num_hierarchies=4",
+    "++should_skip_retry=True"
+  ]
+}

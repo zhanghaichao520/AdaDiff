@@ -1,0 +1,23 @@
+{
+  "start_time": "2025-08-09T18:39:03.746886",
+  "restarts": [
+    {
+      "time": "2025-08-09T18:39:40.923043",
+      "exception": "Caught TypeError in DataLoader worker process 0.\nOriginal Traceback (most recent call last):\n  File \"/data/jwna230/miniconda3/envs/rpg/lib/python3.10/site-packages/torch/utils/data/_utils/worker.py\", line 349, in _worker_loop\n    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]\n  File \"/data/jwna230/miniconda3/envs/rpg/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py\", line 33, in fetch\n    data.append(next(self.dataset_iter))\n  File \"/data/jwna230/peiyu/GenRec/MM-RQVAE/autoregression/src/data/loading/components/dataloading.py\", line 149, in __iter__\n    row_or_batch = preprocessing_function(\n  File \"/data/jwna230/peiyu/GenRec/MM-RQVAE/autoregression/src/data/loading/components/pre_processing.py\", line 66, in convert_to_dense_numpy_array\n    batch_or_row[k] = tf.sparse.to_dense(batch_or_row[k]).numpy()\n  File \"/data/jwna230/miniconda3/envs/rpg/lib/python3.10/site-packages/tensorflow/python/ops/sparse_ops.py\", line 1724, in sparse_tensor_to_dense\n    sp_input = _convert_to_sparse_tensor(sp_input)\n  File \"/data/jwna230/miniconda3/envs/rpg/lib/python3.10/site-packages/tensorflow/python/ops/sparse_ops.py\", line 76, in _convert_to_sparse_tensor\n    raise TypeError(\"Input must be a SparseTensor.\")\nTypeError: Input must be a SparseTensor.\n",
+      "run_number": 0
+    }
+  ],
+  "current_run": 1,
+  "used_ports": [],
+  "world_size": 0,
+  "node_rank": 0,
+  "master_addr": "",
+  "original_args": [
+    "/data/jwna230/peiyu/GenRec/MM-RQVAE/autoregression/src/train.py",
+    "experiment=tiger_train_flat",
+    "+data_dir=../datasets/Baby",
+    "+semantic_id_path=../datasets/Baby/codebook.pt",
+    "+num_hierarchies=4",
+    "++should_skip_retry=True"
+  ]
+}
