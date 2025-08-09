@@ -1,1 +1,1 @@
-python train_rqvae.py --dataset_name Baby --fusion_method clip-align
+python train_rqvae.py --dataset_name Beauty --fusion_method clip-align

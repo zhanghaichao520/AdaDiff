@@ -31,10 +31,10 @@ cache/
 
 # Datasets and outputs
 datasets/
-data/
 output/
 results/
 logs/
+ckpt/
 *.npy
 *.jsonl
 
