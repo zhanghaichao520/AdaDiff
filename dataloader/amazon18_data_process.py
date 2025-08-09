@@ -227,12 +227,24 @@ def generate_data(args, rating_inters):
         test_inters[u_index] = [str(inters[-1])]
         assert len(user2items[u_index]) == len(train_inters[u_index]) + len(valid_inters[u_index]) + len(test_inters[u_index])
     return user2items, train_inters, valid_inters, test_inters, user2index, item2index
+
 def convert_to_atomic_files(args, train_data, valid_data, test_data):
     print('Convert dataset: ')
     print(' Dataset: ', args.dataset)
     uid_list = list(train_data.keys())
     uid_list.sort(key=lambda t: int(t))
-    with open(os.path.join(args.output_path, args.dataset, f'{args.dataset}.train.inter'), 'w') as file:
+
+    # 定义并创建输出子目录
+    training_path = os.path.join(args.output_path, args.dataset, 'training')
+    evaluation_path = os.path.join(args.output_path, args.dataset, 'evaluation')
+    testing_path = os.path.join(args.output_path, args.dataset, 'testing')
+
+    os.makedirs(training_path, exist_ok=True)
+    os.makedirs(evaluation_path, exist_ok=True)
+    os.makedirs(testing_path, exist_ok=True)
+
+    # 保存 train.inter 到 training 文件夹
+    with open(os.path.join(training_path, f'{args.dataset}.train.inter'), 'w') as file:
         file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for uid in uid_list:
             item_seq = train_data[uid]
@@ -241,13 +253,17 @@ def convert_to_atomic_files(args, train_data, valid_data, test_data):
                 target_item = item_seq[-target_idx]
                 seq = item_seq[:-target_idx][-50:]
                 file.write(f'{uid}\t{" ".join(seq)}\t{target_item}\n')
-    with open(os.path.join(args.output_path, args.dataset, f'{args.dataset}.valid.inter'), 'w') as file:
+    
+    # 保存 valid.inter 到 evaluation 文件夹
+    with open(os.path.join(evaluation_path, f'{args.dataset}.valid.inter'), 'w') as file:
         file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for uid in uid_list:
             item_seq = train_data[uid][-50:]
             target_item = valid_data[uid][0]
             file.write(f'{uid}\t{" ".join(item_seq)}\t{target_item}\n')
-    with open(os.path.join(args.output_path, args.dataset, f'{args.dataset}.test.inter'), 'w') as file:
+
+    # 保存 test.inter 到 testing 文件夹
+    with open(os.path.join(testing_path, f'{args.dataset}.test.inter'), 'w') as file:
         file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for uid in uid_list:
             item_seq = (train_data[uid] + valid_data[uid])[-50:]

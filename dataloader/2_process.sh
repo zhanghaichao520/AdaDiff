@@ -3,6 +3,6 @@
 
 
 python amazon18_data_process.py \
-    --dataset Baby \
+    --dataset Beauty \
     --input_path ../datasets \
     --output_path ../datasets
