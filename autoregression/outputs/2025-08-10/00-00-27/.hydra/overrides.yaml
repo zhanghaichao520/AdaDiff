@@ -1,5 +1,0 @@
-- experiment=tiger_train_flat
-- data_dir=../datasets/Beauty
-- semantic_id_path=../datasets/Beauty/codebook.pt
-- num_hierarchies=4
-- ++should_skip_retry=True
