@@ -1,6 +1,7 @@
 import json
 import os
 import pickle
+import importlib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -18,13 +19,46 @@ from datetime import datetime
 from collections import defaultdict
 import numpy as np
 
+def get_model(model_name: str):
+    """
+    为平级结构设计的模型工厂函数。
+    它会从 models/{model_name}.py 文件中加载模型类。
+    
+    Args:
+        model_name (str): 模型名称 (例如 'rqvae')，来自命令行参数。
+
+    Returns:
+        torch.nn.Module: 加载到的模型类 (例如 RQVAE class)。
+    """
+    try:
+        # 1. 动态构建模块路径，例如 'models.rqvae'
+        module_path = f'models.{model_name}'
+        
+        # 2. 导入这个具体的模块 (即 models/rqvae.py 文件)
+        model_module = importlib.import_module(module_path)
+        
+        # 3. 约定类名为模型名的大写形式，例如 'RQVAE'
+        class_name = model_name.upper()
+        model_class = getattr(model_module, class_name)
+        
+    except (ImportError, AttributeError) as e:
+        # 如果找不到模块或类，给出清晰的错误提示
+        print(f"ERROR: 尝试加载模型 '{model_name}' 时失败。 异常: {e}")
+        raise ValueError(
+            f'Model "{model_name}" not found. '
+            f'请检查以下几点：\n'
+            f'1. 在 "models/" 文件夹中是否存在一个名为 "{model_name}.py" 的文件。\n'
+            f'2. 在该文件中，是否定义了一个名为 "{class_name}" 的类。'
+        )
+        
+    return model_class
 def setup_paths(args):
     """根据输入参数构建所有需要的路径"""
     input_embedding_filename = f"{args.dataset_name}.emb-{args.embedding_suffix}.npy"
     embedding_path = os.path.join(args.data_base_path, args.dataset_name, input_embedding_filename)
     
     # 输出目录现在包含量化器名称和特征后缀，实现完全隔离
-    output_base_dir = f"{args.quantizer_name}/{args.embedding_suffix}"
+    output_base_dir = f"{args.model_name}/{args.embedding_suffix}"
     log_dir = os.path.join(args.log_base_path, args.dataset_name, output_base_dir)
     ckpt_dir = os.path.join(args.ckpt_base_path, args.dataset_name, output_base_dir)
     codebook_dir = os.path.join(args.codebook_base_path, args.dataset_name)
@@ -85,9 +119,9 @@ def calc_cos_sim(model, data, config):
         data = data[:, 0, :]
     ids = model.get_codes(data).cpu().numpy()
     max_item_calculate = 1000
-    cos_sim_array = np.zeros(config["num_layers"])
+    cos_sim_array = np.zeros(config["num_levels"])
 
-    for n_prefix in range(1, config["num_layers"] + 1):
+    for n_prefix in range(1, config["num_levels"] + 1):
         unique_prefix = np.unique(ids[:, :n_prefix], axis=0)
         this_level_cos_sim_within_cluster = []
 

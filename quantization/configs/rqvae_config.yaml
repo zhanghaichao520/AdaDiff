@@ -1,6 +1,6 @@
-# 通用训练设置
+eval_interval: 50
 common:
-  device: 'cuda:0' # 'cuda:0' or 'cpu'
+  device: 'cuda:2' # 'cuda:0' or 'cpu'
 
 # --- RQ-VAE 模型配置 ---
 rqvae:
@@ -16,7 +16,7 @@ rqvae:
   training_params:
     beta: 0.25            # commitment loss 的权重
     batch_size: 256
-    epochs: 100
+    epochs: 1000
     lr: 0.001
     weight_decay: 0.0
     optimizer: "AdamW"

@@ -3,94 +3,47 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
+from torch import nn
 
-from .layers import MLP
+from .abstract_vq import AbstractVQ
 
-
-class RQVAE(nn.Module):
-    def __init__(
-        self,
-        input_size,
-        hidden_sizes,
-        latent_size,
-        num_levels,
-        codebook_size,
-        dropout,
-        decay=0.99,
-        loss_type="mse",
-        latent_loss_weight=0.25,
-        bottleneck_type="rq",
-        **kwargs
-    ):
-        super().__init__()
-
-        assert loss_type in ["mse", "l1"]
-
-        self.encoder = MLP(input_size, hidden_sizes, latent_size, dropout=dropout)
-        hidden_sizes.reverse()
-        self.decoder = MLP(latent_size, hidden_sizes, input_size, dropout=dropout)
-
-        if bottleneck_type == "rq":
-            code_shape = [codebook_size] * num_levels
-            self.quantizer = RQBottleneck(
-                latent_shape=latent_size,
-                code_shape=code_shape,
-                decay=decay,
-                shared_codebook=False,
-                restart_unused_codes=True,
+class MLP(nn.Module):
+    def __init__(self, input_size, hidden_sizes, latent_size, dropout=0.0):
+        super(MLP, self).__init__()
+        self.mlp_blocks = nn.ModuleList()
+        self.residuals = nn.ModuleList()
+        self.in_dropout = nn.Dropout(p=dropout)
+        self.out_projection = nn.Linear(hidden_sizes[-1], latent_size)
+        hidden_sizes = [input_size] + hidden_sizes
+        for idx, (input_size, output_size) in enumerate(
+            zip(hidden_sizes[:-1], hidden_sizes[1:])
+        ):
+            self.mlp_blocks.append(
+                nn.Sequential(
+                    nn.Linear(input_size, output_size),
+                    nn.LayerNorm(output_size),
+                    nn.ReLU(),
+                    nn.Dropout(p=dropout),
+                )
             )
-            self.code_shape = code_shape
-        else:
-            raise ValueError("invalid 'bottleneck_type' (must be 'rq')")
+            # add residual connections
+            self.residuals.append(
+                nn.Conv1d(
+                    in_channels=1,
+                    out_channels=output_size,
+                    kernel_size=input_size,
+                    bias=False,
+                    stride=input_size,
+                )
+            )
 
-        self.loss_type = loss_type
-        self.latent_loss_weight = latent_loss_weight
-        self.num_levels = num_levels
-        self.codebook_size = codebook_size
-
-    def forward(self, xs):
-        z_e = self.encode(xs)
-        z_q, quant_loss, code = self.quantizer(z_e)
-        out = self.decode(z_q)
-        return out, quant_loss, code
-
-    def encode(self, x):
-        z_e = self.encoder(x)
-        return z_e
-
-    def decode(self, z_q):
-        out = self.decoder(z_q)
-        return out
-
-    @torch.no_grad()
-    def get_codes(self, xs):
-        z_e = self.encode(xs)
-        _, _, code = self.quantizer(z_e)
-        return code
-
-    def compute_loss(self, out, quant_loss, code, xs=None, valid=False):
-
-        if self.loss_type == "mse":
-            loss_recon = F.mse_loss(out, xs, reduction="mean")
-        elif self.loss_type == "l1":
-            loss_recon = F.l1_loss(out, xs, reduction="mean")
-        else:
-            raise ValueError("incompatible loss type")
-
-        loss_latent = quant_loss
-
-        if valid:
-            loss_recon = loss_recon * xs.shape[0] * xs.shape[1]
-            loss_latent = loss_latent * xs.shape[0]
-
-        loss_total = loss_recon + self.latent_loss_weight * loss_latent
-
-        return {
-            "loss_total": loss_total,
-            "loss_recon": loss_recon,
-            "loss_latent": loss_latent,
-            "codes": [code],
-        }
+    def forward(self, x):
+        x = self.in_dropout(x)
+        for i in range(len(self.mlp_blocks)):
+            res = self.residuals[i](x.unsqueeze(1)).squeeze()
+            x = self.mlp_blocks[i](x)
+            x = x + res
+        return self.out_projection(x)
 
 
 class VQEmbedding(nn.Embedding):
@@ -368,3 +321,86 @@ class RQBottleneck(nn.Module):
         embeds = torch.cat(embeds, dim=-2).sum(-2)
 
         return embeds
+
+
+class RQVAE(nn.Module):
+    def __init__(
+        self,
+        config: dict,
+        input_size: int,
+    ):
+        # --- 核心改动：__init__ 方法现在接收 config 和 input_size ---
+        super().__init__()
+        
+        # 从 config 字典中解析出模型需要的超参数
+        model_params = config['rqvae']['model_params']
+        hidden_sizes = model_params['hidden_sizes']
+        latent_size = model_params['latent_size']
+        num_levels = model_params['num_levels']
+        codebook_size = model_params['codebook_size']
+        dropout = model_params['dropout']
+
+        # 从 config 字典中解析出训练需要的超参数
+        train_params = config['rqvae']['training_params']
+        self.latent_loss_weight = train_params.get('latent_loss_weight', 0.25)
+
+        self.loss_type = train_params.get('loss_type', 'mse')
+        
+        # 使用解析出的参数构建模型 (这部分是您原来的代码)
+        self.encoder = MLP(input_size, hidden_sizes, latent_size, dropout=dropout)
+        rev_hidden_sizes = hidden_sizes.copy()
+        rev_hidden_sizes.reverse()
+        self.decoder = MLP(latent_size, rev_hidden_sizes, input_size, dropout=dropout)
+        
+        code_shape = [codebook_size] * num_levels
+        self.quantizer = RQBottleneck(
+            latent_shape=latent_size,
+            code_shape=code_shape,
+        )
+
+
+    def forward(self, xs):
+        z_e = self.encode(xs)
+        z_q, quant_loss, code = self.quantizer(z_e)
+        out = self.decode(z_q)
+        return out, quant_loss, code
+
+    def encode(self, x):
+        z_e = self.encoder(x)
+        return z_e
+
+    def decode(self, z_q):
+        out = self.decoder(z_q)
+        return out
+
+    @torch.no_grad()
+    def get_codes(self, xs):
+        z_e = self.encode(xs)
+        _, _, code = self.quantizer(z_e)
+        return code
+
+    def compute_loss(self, forward_outputs, xs=None, valid=False):
+        out, quant_loss, code = forward_outputs
+        
+        if self.loss_type == "mse":
+            loss_recon = F.mse_loss(out, xs, reduction="mean")
+        elif self.loss_type == "l1":
+            loss_recon = F.l1_loss(out, xs, reduction="mean")
+        else:
+            raise ValueError("incompatible loss type")
+
+        loss_latent = quant_loss
+
+        # 注意：在我们的通用 Trainer 中，我们是在循环外计算平均损失的，
+        # 所以这里可以简化，不再需要 valid 这个参数和特殊的乘法。
+        # if valid:
+        #     loss_recon = loss_recon * xs.shape[0] * xs.shape[1]
+        #     loss_latent = loss_latent * xs.shape[0]
+
+        loss_total = loss_recon + self.latent_loss_weight * loss_latent
+
+        return {
+            "loss_total": loss_total,
+            "loss_recon": loss_recon,
+            "loss_latent": loss_latent,
+        }

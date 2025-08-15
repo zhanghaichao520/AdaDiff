@@ -1,1 +1,1 @@
-python main.py --quantizer_name rqvae --dataset_name Baby --embedding_suffix "td"
+python main.py --model_name=rqvae --dataset_name=Musical_Instruments --embedding_suffix=td
