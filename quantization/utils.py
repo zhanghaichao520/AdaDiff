@@ -10,6 +10,76 @@ from sklearn.preprocessing import StandardScaler
 from tqdm import trange
 import sys
 
+# quantizers/utils.py
+
+import os
+import logging
+from datetime import datetime
+from collections import defaultdict
+import numpy as np
+
+def setup_paths(args):
+    """根据输入参数构建所有需要的路径"""
+    input_embedding_filename = f"{args.dataset_name}.emb-{args.embedding_suffix}.npy"
+    embedding_path = os.path.join(args.data_base_path, args.dataset_name, input_embedding_filename)
+    
+    # 输出目录现在包含量化器名称和特征后缀，实现完全隔离
+    output_base_dir = f"{args.quantizer_name}/{args.embedding_suffix}"
+    log_dir = os.path.join(args.log_base_path, args.dataset_name, output_base_dir)
+    ckpt_dir = os.path.join(args.ckpt_base_path, args.dataset_name, output_base_dir)
+    codebook_dir = os.path.join(args.codebook_base_path, args.dataset_name)
+
+    for d in [log_dir, ckpt_dir, codebook_dir]:
+        os.makedirs(d, exist_ok=True)
+        
+    print("--- 自动构建路径 (模块化版) ---")
+    print(f"输入特征: {embedding_path}")
+    print(f"配置文件: {args.config_path}")
+    print(f"日志目录: {log_dir}")
+    print(f"模型目录: {ckpt_dir}")
+    print(f"码本目录: {codebook_dir}")
+    print("------------------------------------\n")
+
+    return embedding_path, log_dir, ckpt_dir, codebook_dir
+
+def setup_logging(log_dir):
+    """配置日志记录器"""
+    log_filename = os.path.join(log_dir, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - [%(module)s] - %(message)s',
+        handlers=[logging.FileHandler(log_filename), logging.StreamHandler()]
+    )
+    logging.info("Logging setup complete.")
+
+def build_dedup_layer(base_codes_np: np.ndarray, vocab_size: int):
+    """
+    为基础码本添加一个去重层。
+    对基础码完全相同的条目，在各自簇内部分配 0..k-1 的ID。
+    这是一个通用逻辑，可以被任何产生分层码本的模型复用。
+    """
+    logging.info("构建去重层...")
+    N = base_codes_np.shape[0]
+    groups = defaultdict(list)
+    for idx, key in enumerate(map(tuple, base_codes_np)):
+        groups[key].append(idx)
+
+    dedup_layer = np.zeros((N, 1), dtype=np.int64)
+    max_dup, overflow_count = 0, 0
+    for idx_list in groups.values():
+        k = len(idx_list)
+        max_dup = max(max_dup, k)
+        if k > vocab_size:
+            logging.warning(f"一个簇内重复数 {k} > 码本大小 {vocab_size}。去重ID将取模，可能导致碰撞。")
+            local_ids = np.arange(k, dtype=np.int64) % vocab_size
+            overflow_count += 1
+        else:
+            local_ids = np.arange(k, dtype=np.int64)
+        dedup_layer[np.array(idx_list), 0] = local_ids
+    
+    logging.info(f"去重层构建完成。最大簇内重复数: {max_dup}。发生取模的簇数量: {overflow_count}。")
+    return dedup_layer
+
 def calc_cos_sim(model, data, config):
     if len(data.shape) > 2:
         data = data[:, 0, :]

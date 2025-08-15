@@ -1,0 +1,1 @@
+{"Val_Metric/ndcg@10":0,"Val_Metric/recall@10":0,"_runtime":8.616033926,"_wandb":{"runtime":8},"_step":4,"Loss/train_loss":NaN,"_timestamp":1.7551968826141086e+09,"Val_Metric/ndcg@5":0,"Val_Metric/recall@5":0}

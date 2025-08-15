@@ -1,0 +1,64 @@
+{
+  "os": "Linux-6.8.0-65-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.18",
+  "startedAt": "2025-08-15T05:56:51.109938Z",
+  "args": [
+    "--category=Musical_Instruments"
+  ],
+  "program": "/mnt/disk9T/zj/projects/peiyu/GenRec/MM-RQVAE/recommendation/main.py",
+  "codePath": "recommendation/main.py",
+  "git": {
+    "remote": "https://github.com/hupeiyu21/MM-RQVAE.git",
+    "commit": "8f8ef866e1c515997aafafa470e4744d5bee01d5"
+  },
+  "email": "3029678538@qq.com",
+  "root": "/mnt/disk9T/zj/projects/peiyu/GenRec/MM-RQVAE/recommendation",
+  "host": "star-R5300-G5",
+  "username": "zj",
+  "executable": "/mnt/disk20T1/zj/miniconda3/envs/cdrs/bin/python",
+  "codePathLocal": "main.py",
+  "cpu_count": 72,
+  "cpu_count_logical": 144,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 4,
+  "disk": {
+    "/": {
+      "total": "1333714489344",
+      "used": "1207822483456"
+    }
+  },
+  "memory": {
+    "total": "540627144704"
+  },
+  "cpu": {
+    "count": 72,
+    "countLogical": 144
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada"
+    },
+    {
+      "name": "NVIDIA RTX A6000",
+      "memoryTotal": "51527024640",
+      "cudaCores": 10752,
+      "architecture": "Ampere"
+    },
+    {
+      "name": "NVIDIA RTX A6000",
+      "memoryTotal": "51527024640",
+      "cudaCores": 10752,
+      "architecture": "Ampere"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada"
+    }
+  ],
+  "cudaVersion": "12.4"
+}

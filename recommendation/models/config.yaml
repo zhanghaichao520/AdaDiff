@@ -41,6 +41,7 @@ temperature: 0.07
 num_beams: 50
 n_edges: 50
 propagation_steps: 3
+dropout: 0.3
 
 # --- 第四部分: RQ-VAE 参数 (我们唯一的"ID配置"来源) ---
 # 这是新的 Tokenizer 和模型唯一依赖的 ID 配置。
@@ -49,7 +50,7 @@ RQ-VAE:
   input_dim: 512          
   hidden_dim: [1024, 512] 
   latent_dim: 256         # RQ-VAE 模型的潜空间维度
-  num_layers: 3           # 这是 Codebook 的数量 (n_codebooks)
+  num_layers: 4           # 这是 Codebook 的数量 (n_codebooks)
   code_book_size: 2048    # 这是单个 Codebook 的大小
   dropout: 0.0
   beta: 0.25

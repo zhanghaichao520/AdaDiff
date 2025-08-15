@@ -6,7 +6,7 @@
 
 from logging import getLogger
 
-from dataloader.dataset import AbstractDataset
+from dataset import AbstractDataset
 
 
 class AbstractTokenizer:
@@ -35,5 +35,5 @@ class AbstractTokenizer:
         raise NotImplementedError('Maximum token sequence length not implemented.')
 
     def log(self, message, level='info'):
-        from decoder.utils import log
+        from utils import log
         return log(message, self.config['accelerator'], self.logger, level=level)

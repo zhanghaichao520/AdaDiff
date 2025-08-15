@@ -5,11 +5,11 @@ import os
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 
-from decoder.models.tokenizer import Tokenizer
-from decoder.dataset import AbstractDataset
-from decoder.model import AbstractModel
-from decoder.tokenizer import AbstractTokenizer
-from decoder.utils import get_config, init_seed, init_logger, init_device, \
+from models.tokenizer import Tokenizer
+from dataset import AbstractDataset
+from model import AbstractModel
+from tokenizer import AbstractTokenizer
+from utils import get_config, init_seed, init_logger, init_device, \
     get_dataset, get_tokenizer, get_model, get_trainer, log
 
 
@@ -55,15 +55,18 @@ class Pipeline:
         self.split_datasets = self.raw_dataset.split()
 
         # Tokenizer
-        # --- 核心改动：我们现在强制使用新的 RQVAETokenizer ---
-        self.log("Initializing with RQVAETokenizer...")
-        self.tokenizer = Tokenizer(self.config, self.raw_dataset)
-        # --- 结束 ---
+        # 2. 【核心改动】接着独立初始化 Tokenizer
+        self.log("Initializing with standalone Tokenizer...")
+        # 注意：构造函数不再传入 self.raw_dataset
+        self.tokenizer = Tokenizer(self.config) 
+
+        # 3. Tokenizer 处理数据集
         self.tokenized_datasets = self.tokenizer.tokenize(self.split_datasets)
+
 
         # Model
         with self.accelerator.main_process_first():
-            self.model = get_model(model_name)(self.config, self.raw_dataset, self.tokenizer)
+            self.model = get_model(model_name)(self.config, self.tokenizer)
             if checkpoint_path is not None:
                 self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.config['device']))
                 self.log(f'Loaded model checkpoint from {checkpoint_path}')
@@ -85,7 +88,7 @@ class Pipeline:
             collate_fn=self.tokenizer.collate_fn['train']
         )
         val_dataloader = DataLoader(
-            self.tokenized_datasets['val'],
+            self.tokenized_datasets['valid'],
             batch_size=self.config['eval_batch_size'],
             shuffle=False,
             collate_fn=self.tokenizer.collate_fn['val']

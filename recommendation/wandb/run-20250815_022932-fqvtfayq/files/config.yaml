@@ -1,0 +1,160 @@
+_wandb:
+    value:
+        cli_version: 0.19.0
+        m: []
+        python_version: 3.10.18
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 51
+                - 53
+                - 55
+                - 71
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 51
+                - 53
+                - 55
+                - 71
+            "3":
+                - 13
+                - 23
+                - 55
+            "4": 3.10.18
+            "5": 0.19.0
+            "6": 4.53.2
+            "8":
+                - 5
+            "12": 0.19.0
+            "13": linux-x86_64
+RQ-VAE:
+    value:
+        beta: 0.25
+        code_book_size: 2048
+        dropout: 0
+        hidden_dim:
+            - 1024
+            - 512
+        input_dim: 512
+        latent_dim: 256
+        num_layers: 4
+activation_function:
+    value: gelu_new
+attn_pdrop:
+    value: 0.5
+cache_dir:
+    value: cache/
+category:
+    value: Musical_Instruments
+ckpt_dir:
+    value: ckpt/
+codebook_size:
+    value: 256
+dataset:
+    value: AmazonReviews2014
+embd_pdrop:
+    value: 0.5
+epochs:
+    value: 300
+eval_batch_size:
+    value: 32
+eval_interval:
+    value: 1
+faiss_omp_num_threads:
+    value: 32
+initializer_range:
+    value: 0.02
+layer_norm_epsilon:
+    value: 1e-12
+log_dir:
+    value: logs/
+lr:
+    value: 0.0003
+max_grad_norm:
+    value: 1
+max_item_seq_len:
+    value: 50
+metadata:
+    value: sentence
+metrics:
+    value: '[''ndcg'', ''recall'']'
+model:
+    value: encoder_retrieve
+n_codebook:
+    value: 32
+n_edges:
+    value: 50
+n_embd:
+    value: 448
+n_head:
+    value: 4
+n_inner:
+    value: 1024
+n_layer:
+    value: 2
+num_beams:
+    value: 50
+num_proc:
+    value: 1
+openai_api_key:
+    value: sk-WR6aJpZ81gACet0aN8wXYx0lUfC0WgjjcrFRZAJKatkeuTke
+opq_gpu_id:
+    value: 0
+opq_use_gpu:
+    value: false
+patience:
+    value: 20
+penai_base_url:
+    value: https://yunwu.ai/v1
+propagation_steps:
+    value: 3
+rand_seed:
+    value: 2024
+reproducibility:
+    value: true
+resid_pdrop:
+    value: 0
+run_id:
+    value: genrec_default
+run_local_time:
+    value: Aug-15-2025_02-29
+sent_emb_batch_size:
+    value: 512
+sent_emb_dim:
+    value: 3072
+sent_emb_model:
+    value: text-embedding-3-large
+sent_emb_pca:
+    value: 512
+steps:
+    value: null
+temperature:
+    value: 0.07
+tensorboard_log_dir:
+    value: tensorboard/
+test_eval_interval:
+    value: 5
+topk:
+    value: '[5, 10]'
+train_batch_size:
+    value: 512
+use_ddp:
+    value: false
+val_metric:
+    value: ndcg@10
+wandb:
+    value:
+        project_name: RPG_RQVAE
+        run_id: rqvae
+warmup_steps:
+    value: 10000
+weight_decay:
+    value: 0

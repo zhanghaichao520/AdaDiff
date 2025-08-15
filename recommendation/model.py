@@ -7,8 +7,8 @@
 import torch.nn as nn
 
 
-from decoder.dataset import AbstractDataset
-from decoder.tokenizer import AbstractTokenizer
+from dataset import AbstractDataset
+from tokenizer import AbstractTokenizer
 
 
 class AbstractModel(nn.Module):

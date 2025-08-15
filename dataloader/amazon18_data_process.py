@@ -234,17 +234,15 @@ def convert_to_atomic_files(args, train_data, valid_data, test_data):
     uid_list = list(train_data.keys())
     uid_list.sort(key=lambda t: int(t))
 
-    # 定义并创建输出子目录
-    training_path = os.path.join(args.output_path, args.dataset, 'training')
-    evaluation_path = os.path.join(args.output_path, args.dataset, 'evaluation')
-    testing_path = os.path.join(args.output_path, args.dataset, 'testing')
+    # --- 修改开始 ---
+    # 定义输出的根目录，不再创建子文件夹
+    output_dir = os.path.join(args.output_path, args.dataset)
+    # 确保这个根目录存在
+    os.makedirs(output_dir, exist_ok=True)
+    # --- 修改结束 ---
 
-    os.makedirs(training_path, exist_ok=True)
-    os.makedirs(evaluation_path, exist_ok=True)
-    os.makedirs(testing_path, exist_ok=True)
-
-    # 保存 train.inter 到 training 文件夹
-    with open(os.path.join(training_path, f'{args.dataset}.train.inter'), 'w') as file:
+    # 保存 train.inter，直接使用 output_dir
+    with open(os.path.join(output_dir, f'{args.dataset}.train.inter'), 'w') as file:
         file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for uid in uid_list:
             item_seq = train_data[uid]
@@ -254,16 +252,16 @@ def convert_to_atomic_files(args, train_data, valid_data, test_data):
                 seq = item_seq[:-target_idx][-50:]
                 file.write(f'{uid}\t{" ".join(seq)}\t{target_item}\n')
     
-    # 保存 valid.inter 到 evaluation 文件夹
-    with open(os.path.join(evaluation_path, f'{args.dataset}.valid.inter'), 'w') as file:
+    # 保存 valid.inter，直接使用 output_dir
+    with open(os.path.join(output_dir, f'{args.dataset}.valid.inter'), 'w') as file:
         file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for uid in uid_list:
             item_seq = train_data[uid][-50:]
             target_item = valid_data[uid][0]
             file.write(f'{uid}\t{" ".join(item_seq)}\t{target_item}\n')
 
-    # 保存 test.inter 到 testing 文件夹
-    with open(os.path.join(testing_path, f'{args.dataset}.test.inter'), 'w') as file:
+    # 保存 test.inter，直接使用 output_dir
+    with open(os.path.join(output_dir, f'{args.dataset}.test.inter'), 'w') as file:
         file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for uid in uid_list:
             item_seq = (train_data[uid] + valid_data[uid])[-50:]

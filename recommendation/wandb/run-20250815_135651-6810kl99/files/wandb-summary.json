@@ -1,0 +1,1 @@
+{"_runtime":237.005631436,"Loss/train_loss":16.485485076904297,"_wandb":{"runtime":237},"Val_Metric/ndcg@5":0,"Test_Periodic_Metric/ndcg@10":0,"Val_Metric/ndcg@10":0,"_step":32,"Val_Metric/recall@10":0,"Test_Periodic_Metric/ndcg@5":0,"Val_Metric/recall@5":0,"_timestamp":1.7552376476284575e+09,"Test_Periodic_Metric/recall@5":0,"Test_Periodic_Metric/recall@10":0}

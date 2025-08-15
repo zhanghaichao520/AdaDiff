@@ -11,10 +11,30 @@ import tiktoken
 from typing import Union, Optional
 import logging
 from logging import getLogger
-
-from decoder.model import AbstractModel
-from dataloader.dataset import AbstractDataset
 from accelerate.utils import set_seed
+
+from dataset import InterDataset 
+from model import AbstractModel
+from dataset import AbstractDataset
+
+def get_dataset(dataset_name: str):
+    """
+    数据集工厂函数 (Dataset Factory)。
+
+    根据传入的数据集名称，返回对应的数据集处理【类】。
+    pipeline 会用返回的类和 config 来创建实例。
+    """
+    # 在这里，我们进行一个简单的判断。
+    # 无论命令行传入 --dataset AmazonReviews2014 还是 --dataset Baby
+    # 只要它们的数据格式都遵循 .inter 规范，我们都返回 InterDataset 这个类来处理。
+    
+    # 您可以将所有遵循该格式的数据集名称都列在这里
+    if dataset_name in ["AmazonReviews2014", "Beauty", "Baby"]: 
+        print(f"INFO: Routing dataset '{dataset_name}' to InterDataset loader.")
+        return InterDataset
+    else:
+        # 如果将来有其他类型的数据集，可以在这里添加 elif 分支
+        raise ValueError(f"在 utils.py 的 get_dataset 中, 未知或未注册的数据集名称: '{dataset_name}'")
 
 
 def init_seed(seed, reproducibility):
@@ -192,7 +212,7 @@ def get_tokenizer(model_name: str):
     """
     try:
         tokenizer_class = getattr(
-            importlib.import_module(f'decoder.models.{model_name}.tokenizer'),
+            importlib.import_module(f'models.tokenizer'),
             f'{model_name}Tokenizer'
         )
     except:
@@ -200,87 +220,35 @@ def get_tokenizer(model_name: str):
     return tokenizer_class
 
 
-def get_model(model_name: Union[str, AbstractModel]) -> AbstractModel:
+def get_model(model_name: str) -> AbstractModel:
     """
-    Retrieves the model class based on the provided model name.
-
-    Args:
-        model_name (Union[str, AbstractModel]): The name of the model or an instance of the model class.
-
-    Returns:
-        AbstractModel: The model class corresponding to the provided model name.
-
-    Raises:
-        ValueError: If the model name is not found.
+    更智能的模型工厂函数。
+    它会自动从 models/{model_name}/model.py 路径加载模型类。
     """
-    if isinstance(model_name, AbstractModel):
-        return model_name
-
     try:
-        model_class = getattr(
-            importlib.import_module('decoder.models'),
-            model_name
+        # 1. 动态地构建模型所在的模块路径
+        #    例如，如果 model_name 是 'encoder_retrieve'，路径就是 'models.encoder_retrieve.model'
+        module_path = f'models.{model_name}.model'
+        
+        # 2. 导入这个具体的模块
+        model_module = importlib.import_module(module_path)
+        
+        # 3. 从导入的模块中，根据模型名称获取模型【类】
+        #    这里我们约定，类名和模型名(文件夹名)是一样的
+        model_class = getattr(model_module, model_name)
+        
+    except (ImportError, AttributeError) as e:
+        # 如果找不到模块或类，给出清晰的错误提示
+        print(f"ERROR: 尝试加载模型 '{model_name}' 时失败。 异常: {e}")
+        raise ValueError(
+            f'Model "{model_name}" not found. '
+            f'请检查以下几点：\n'
+            f'1. 是否存在名为 "models/{model_name}/" 的文件夹。\n'
+            f'2. 该文件夹中是否存在一个 "model.py" 文件。\n'
+            f'3. 在 "model.py" 文件中，是否定义了一个与文件夹同名的类，即 class {model_name}(...):'
         )
-    except:
-        raise ValueError(f'Model "{model_name}" not found.')
+        
     return model_class
-
-
-def get_dataset(dataset_name: Union[str, AbstractDataset]) -> AbstractDataset:
-    """
-    Get the dataset object based on the dataset name or directly return the dataset object if it is already provided.
-
-    Args:
-        dataset_name (Union[str, AbstractDataset]): The name of the dataset or the dataset object itself.
-
-    Returns:
-        AbstractDataset: The dataset object.
-
-    Raises:
-        ValueError: If the dataset name is not found.
-    """
-    if isinstance(dataset_name, AbstractDataset):
-        return dataset_name
-
-    try:
-        if dataset_name == 'AmazonReviews2014':
-            # 使用 AmazonDataProcessor 进行完整的数据处理
-            from dataloader.amazon_data_processor import AmazonDataProcessor
-            
-            # 创建一个包装类，使其兼容 AbstractDataset 接口
-            class AmazonReviews2014Wrapper(AbstractDataset):
-                def __init__(self, config):
-                    super().__init__(config)
-                    self.category = config['category']
-                    self.cache_dir = config.get('cache_dir', 'cache')
-                    
-                    # 使用 AmazonDataProcessor 进行数据处理
-                    processor = AmazonDataProcessor(
-                        category=self.category,
-                        cache_dir=self.cache_dir,
-                        config_path=None,
-                        config=config
-                    )
-                    processor.run_full_pipeline()
-                    
-                    # 加载处理后的数据
-                    self.all_item_seqs = processor.all_item_seqs
-                    self.id_mapping = processor.id_mapping
-                    self.item2meta = processor.item2meta
-                    
-                def _download_and_process_raw(self):
-                    # 已在 __init__ 中完成
-                    pass
-            
-            return AmazonReviews2014Wrapper
-        else:
-            # 其他数据集的处理逻辑
-            dataset_module = importlib.import_module(f'dataloader.{dataset_name}.dataset')
-            dataset_class = getattr(dataset_module, dataset_name)
-    except:
-        raise ValueError(f'Dataset "{dataset_name}" not found.')
-    return dataset_class
-
 
 def get_trainer(model_name: Union[str, AbstractModel]):
     """
@@ -292,11 +260,11 @@ def get_trainer(model_name: Union[str, AbstractModel]):
     Returns:
         trainer_class: The trainer class corresponding to the given model name. If the model name is not found, the default Trainer class is returned.
     """
-    from decoder.trainer import Trainer
+    from trainer import Trainer
     if isinstance(model_name, str):
         try:
             trainer_class = getattr(
-                importlib.import_module(f'decoder.models.{model_name}.trainer'),
+                importlib.import_module(f'models.trainer'),
                 f'{model_name}Trainer'
             )
             return trainer_class
@@ -316,11 +284,11 @@ def get_pipeline(model_name: Union[str, AbstractModel]):
     Returns:
         pipeline_class: The pipeline class corresponding to the given model name. If the model name is not found, the default Pipeline class is returned.
     """
-    from decoder.pipeline import Pipeline
+    from pipeline import Pipeline
     if isinstance(model_name, str):
         try:
             pipeline_class = getattr(
-                importlib.import_module(f'decoder.models.{model_name}.pipeline'),
+                importlib.import_module(f'models.{model_name}.pipeline'),
                 f'{model_name}Pipeline'
             )
             return pipeline_class
@@ -377,6 +345,8 @@ def convert_config_dict(config: dict) -> dict:
     return config
 
 
+# /recommendation/utils.py
+
 def get_config(
     model_name: Union[str, AbstractModel],
     dataset_name: Union[str, AbstractDataset],
@@ -385,24 +355,9 @@ def get_config(
 ) -> dict:
     """
     Get the configuration for a model and dataset.
-    Overwrite rule: config_dict > config_file > model config.yaml > dataset config.yaml > default.yaml
-
-    Args:
-        model_name (Union[str, AbstractModel]): The name of the model or an instance of the model class.
-        dataset_name (Union[str, AbstractDataset]): The name of the dataset or an instance of the dataset class.
-        config_file (Union[str, list[str], None]): The path to additional configuration file(s) or a list of paths to multiple additional configuration files. If None, default configurations will be used.
-        config_dict (Optional[dict]): A dictionary containing additional configuration options. These options will override the ones loaded from the configuration file(s).
-
-    Returns:
-        dict: The final configuration dictionary.
-
-    Raises:
-        FileNotFoundError: If any of the specified configuration files cannot be found.
-
-    Note:
-        - If `model_name` is a string, the function will attempt to load the model's configuration file located at `genrec/models/{model_name}/config.yaml`.
-        - If `dataset_name` is a string, the function will attempt to load the dataset's configuration file located at `genrec/datasets/{dataset_name}/config.yaml`.
-        - The function will merge the configurations from all the specified configuration files and the `config_dict` parameter.
+    Overwrite rule: config_dict > config_file > model config.yaml > default.yaml
+    
+    # 移除加载数据集配置的逻辑
     """
     final_config = {}
     logger = getLogger()
@@ -412,9 +367,6 @@ def get_config(
     config_file_list = [os.path.join(current_path, 'default.yaml')]
 
     if isinstance(dataset_name, str):
-        config_file_list.append(
-            os.path.join(current_path, f'../dataloader/{dataset_name}/config.yaml')
-        )
         final_config['dataset'] = dataset_name
     else:
         logger.info(
@@ -425,6 +377,7 @@ def get_config(
         final_config['dataset'] = dataset_name.__class__.__name__
 
     if isinstance(model_name, str):
+        # 你的想法是只加载 models/config.yaml，而不是每个模型的独立配置
         config_file_list.append(
             os.path.join(current_path, f'models/config.yaml')
         )
@@ -451,7 +404,6 @@ def get_config(
         final_config.update(config_dict)
 
     final_config['run_local_time'] = get_local_time()
-
     final_config = convert_config_dict(final_config)
     return final_config
 

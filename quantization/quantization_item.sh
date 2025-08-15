@@ -1,1 +1,1 @@
-python train_rqvae.py --dataset_name Beauty --fusion_method clip-align
+python main.py --quantizer_name rqvae --dataset_name Baby --embedding_suffix "td"

@@ -16,10 +16,10 @@ from torch.optim import AdamW
 from torch.nn.utils import clip_grad_norm_
 from transformers.optimization import get_scheduler
 
-from decoder.model import AbstractModel
-from decoder.tokenizer import AbstractTokenizer
-from decoder.evaluator import Evaluator
-from decoder.utils import get_file_name, get_total_steps, config_for_log, log
+from model import AbstractModel
+from tokenizer import AbstractTokenizer
+from evaluator import Evaluator
+from utils import get_file_name, get_total_steps, config_for_log, log
 
 
 class Trainer:
