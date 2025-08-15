@@ -63,11 +63,21 @@ python main.py --category=Musical_Instruments --model=encoder_decoder
 
 ### Quantization
 
-`main.py`控制所有的模型的训练
+**不需要动的模块**
 
-每一个模型，都有一个对应名称的文件，里面包括了当前模型需要的所有模块，比如rqvae就是vq+mlp的文件，此外，还需要配置一个train.py用于训练。如果需要扩展新的模型，新建一个当前模型的文件夹。在`main.py`里面增加切换的逻辑
+`main.py`: 控制整体的训练流程, 训练流程是固定的，数据的输入的固定的
+
+`trainer.py`: 控制模型的训练策略，输入和输出都是确定的，只需要改模型内部的结构
+
+`dataset.py`: 数据的处理，加载是固定的，一套策略
+
+**需要动的模块**
+
+`evaluate.py`: 可以增加不同的评估方式
 
 `/models`文件夹里面包括所有不同的模型，比如vq, rqvae,要新加模型，就可以新建一个模型名称，然后把所有的都放进去
+
+`utils.py`: 根据需要更新，如果某个方法太通用或太融于，可以放进来
 
 ### Recommendation
 
