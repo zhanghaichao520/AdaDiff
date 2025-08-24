@@ -1,0 +1,23 @@
+{
+  "start_time": "2025-08-11T21:08:56.343567",
+  "restarts": [
+    {
+      "time": "2025-08-11T21:09:04.947959",
+      "exception": "Caught FileNotFoundError in DataLoader worker process 0.\nOriginal Traceback (most recent call last):\n  File \"/data/jwna230/miniconda3/envs/rpg/lib/python3.10/site-packages/torch/utils/data/_utils/worker.py\", line 349, in _worker_loop\n    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]\n  File \"/data/jwna230/miniconda3/envs/rpg/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py\", line 33, in fetch\n    data.append(next(self.dataset_iter))\n  File \"/data/jwna230/peiyu/GenRec/MM-RQVAE/autoregression/src/data/loading/components/dataloading.py\", line 145, in __iter__\n    for row_or_batch in self.dataset_to_iterate:\n  File \"/data/jwna230/peiyu/GenRec/MM-RQVAE/autoregression/src/data/loading/components/iterators.py\", line 261, in iterrows\n    with open(file_path, 'r', encoding='utf-8') as f:\nFileNotFoundError: [Errno 2] No such file or directory: 'file:///data/jwna230/peiyu/GenRec/MM-RQVAE/autoregression/../datasets/Baby/training/Baby.train.inter'\n",
+      "run_number": 0
+    }
+  ],
+  "current_run": 1,
+  "used_ports": [],
+  "world_size": 0,
+  "node_rank": 0,
+  "master_addr": "",
+  "original_args": [
+    "/data/jwna230/peiyu/GenRec/MM-RQVAE/autoregression/src/train.py",
+    "experiment=tiger_train_flat",
+    "data_dir=../datasets/Baby",
+    "semantic_id_path=../datasets/Baby/codebook.pt",
+    "num_hierarchies=4",
+    "++should_skip_retry=True"
+  ]
+}
