@@ -165,3 +165,17 @@ def process_embeddings(config, device, id2meta_file=None, embedding_save_path=No
 def set_weight_decay(optimizer, weight_decay):
     for param_group in optimizer.param_groups:
         param_group["weight_decay"] = weight_decay
+
+def build_codebook_path(codebook_base_path: str, dataset_name: str, model_name: str) -> str:
+    """
+    生成码本保存/读取的规范路径:
+      {codebook_base_path}/{dataset_name}/{dataset_name}.{model_name.lower()}.codebook.npy
+    例如:
+      ../datasets/Beauty/Beauty.rqvae.codebook.npy
+    """
+    ds = str(dataset_name)
+    model_tag = str(model_name).lower()
+    dir_path = os.path.join(codebook_base_path, ds)
+    os.makedirs(dir_path, exist_ok=True)
+    filename = f"{ds}.{model_tag}.codebook.npy"
+    return os.path.join(dir_path, filename)

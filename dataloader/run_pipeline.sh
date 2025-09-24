@@ -6,7 +6,7 @@
 set -e  # Exit on any error
 
 # Default parameters
-DATASET="Baby"
+DATASET="Musical_Instruments"
 INPUT_PATH="../datasets"
 OUTPUT_PATH="../datasets"
 GPU_ID="2"
@@ -20,7 +20,7 @@ print_usage() {
     echo "Usage: $0 [OPTIONS] [STEPS]"
     echo ""
     echo "OPTIONS:"
-    echo "  --dataset DATASET          Dataset name (default: Baby)"
+    echo "  --dataset DATASET          Dataset name (default: Musical_Instruments)"
     echo "  --input-path PATH          Input data path (default: ../datasets)"
     echo "  --output-path PATH         Output data path (default: ../datasets)"
     echo "  --gpu-id ID                GPU device ID (default: 1)"
@@ -44,8 +44,8 @@ print_usage() {
     echo "  fusion-emb                 Fusion embeddings"
     echo ""
     echo "EXAMPLES:"
-    echo "  $0 --dataset Beauty                    # Run all steps for Beauty dataset"
-    echo "  $0 --dataset Baby download process     # Run only download and process steps"
+    echo "  $0 --dataset Musical_Instruments                    # Run all steps for Musical_Instruments dataset"
+    echo "  $0 --dataset Musical_Instruments download process     # Run only download and process steps"
     echo "  $0 --skip-images --skip-image-emb     # Skip image-related steps"
 }
 
@@ -228,30 +228,30 @@ if should_run_step "text-emb"; then
     echo "Text embedding generation completed!"
 fi
 
-# Step 5: Generate Image Embeddings
-if should_run_step "image-emb"; then
-    print_step "Generate Image Embeddings"
-    echo "Generating image embeddings for $DATASET dataset..."
-    export CUDA_VISIBLE_DEVICES="$GPU_ID"
-    python clip_feature.py \
-        --image_root "$IMAGE_ROOT" \
-        --save_root "$OUTPUT_PATH" \
-        --model_cache_dir "$MODEL_CACHE_DIR" \
-        --dataset "$DATASET"
-    echo "Image embedding generation completed!"
-fi
+# # Step 5: Generate Image Embeddings
+# if should_run_step "image-emb"; then
+#     print_step "Generate Image Embeddings"
+#     echo "Generating image embeddings for $DATASET dataset..."
+#     export CUDA_VISIBLE_DEVICES="$GPU_ID"
+#     python clip_feature.py \
+#         --image_root "$IMAGE_ROOT" \
+#         --save_root "$OUTPUT_PATH" \
+#         --model_cache_dir "$MODEL_CACHE_DIR" \
+#         --dataset "$DATASET"
+#     echo "Image embedding generation completed!"
+# fi
 
-# Step 6: Fusion Embeddings
-if should_run_step "fusion-emb"; then
-    print_step "Fusion Embeddings"
-    echo "Fusing embeddings for $DATASET dataset..."
-    export CUDA_VISIBLE_DEVICES="$GPU_ID"
-python fusion_embeddings.py \
-    --method cross-attention \
-    --dataset_name $DATASET \
-    --epochs 20 \
-    --embed_dim 768 \
-    --nhead 4
+# # Step 6: Fusion Embeddings
+# if should_run_step "fusion-emb"; then
+#     print_step "Fusion Embeddings"
+#     echo "Fusing embeddings for $DATASET dataset..."
+#     export CUDA_VISIBLE_DEVICES="$GPU_ID"
+# python fusion_embeddings.py \
+#     --method cross-attention \
+#     --dataset_name $DATASET \
+#     --epochs 20 \
+#     --embed_dim 768 \
+#     --nhead 4
 
 
 echo ""

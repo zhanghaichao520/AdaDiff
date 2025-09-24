@@ -86,6 +86,32 @@ class Trainer:
                 logging.info(f"[VAL] Cosine Similarity per level: {np.round(cos_sim_array, 4)}")
                 # --- 改动结束 ---
 
+                                # --- 核心改动 3：更多指标 ---
+                with torch.no_grad():
+                    # 获取一个 batch 的离散编码
+                    val_codes = self.model.get_codes(val_sample_data).detach().cpu().numpy()
+                    num_levels = val_codes.shape[1]
+
+                    # 1. 每层活跃 code 数量
+                    active_counts = [len(np.unique(val_codes[:, i])) for i in range(num_levels)]
+                    logging.info(f"[VAL] Active codes per level: {active_counts}")
+
+                    # 2. 每层 code 使用分布熵（衡量利用均匀度）
+                    usage_entropy = []
+                    for i in range(num_levels):
+                        unique, counts = np.unique(val_codes[:, i], return_counts=True)
+                        probs = counts / counts.sum()
+                        entropy = -np.sum(probs * np.log2(probs + 1e-9))
+                        usage_entropy.append(round(float(entropy), 4))
+                    logging.info(f"[VAL] Code usage entropy per level: {usage_entropy}")
+
+                    # 3. 碰撞率（完全相同的 code 行数 / 总数）
+                    unique_rows = np.unique(val_codes, axis=0).shape[0]
+                    collision_rate = 1 - unique_rows / val_codes.shape[0]
+                    logging.info(f"[VAL] Collision rate (batch): {collision_rate:.4f}")
+                # --- 改动结束 ---
+
+
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     torch.save(self.model.state_dict(), best_model_path)
@@ -97,9 +123,12 @@ class Trainer:
     def predict(self, embeddings_path: str, codebook_dir: str):
         logging.info(f"--- 开始用 {self.model_name} 生成码本 ---")
         self.model.eval()
+
+        # 1) 数据加载
         full_dataset = EmbeddingDataset(embeddings_path)
         dataloader = DataLoader(full_dataset, batch_size=self.train_params['batch_size'])
-        
+
+        # 2) 推理得到基础 codes
         all_codes = []
         with torch.no_grad():
             for batch_data in tqdm(dataloader, desc="生成基础码"):
@@ -108,16 +137,34 @@ class Trainer:
                 all_codes.append(codes)
 
         base_sids_np = np.vstack(all_codes)
+
+        # 3) 构建去重层并拼最终 codebook
         vocab_size = self.model_config['model_params']['codebook_size']
         dedup_layer = utils.build_dedup_layer(base_sids_np, vocab_size)
         final_codes_np = np.concatenate([base_sids_np, dedup_layer], axis=1).astype(np.int32)
         logging.info(f"最终码本维度: {final_codes_np.shape}")
-        
-        json_path = os.path.join(codebook_dir, f"{self.config['dataset_name']}.codebook.json")
-        pt_path = os.path.join(codebook_dir, f"{self.config['dataset_name']}.codebook.pt")
-        
-        # 保存逻辑...
+
+        # 4) 规范化保存路径：{dataset}/{dataset}.{model}.codebook.{npy,json}
+        dataset_name = str(self.config['dataset_name'])
+        model_tag = str(self.config['model_name']).lower()
+
+        os.makedirs(codebook_dir, exist_ok=True)  # 兜底确保目录存在
+        std_prefix = os.path.join(codebook_dir, f"{dataset_name}.{model_tag}.codebook")
+        json_path = f"{std_prefix}.json"
+        npy_path  = f"{std_prefix}.npy"
+
+        # 5) 生成 JSON 词表（可用于可视化/调试）
+        prefix = ["<a_{}>", "<b_{}>", "<c_{}>", "<d_{}>", "<e_{}>"]  # 前几层前缀
+        dedup_prefix = "<x_{}>"  # 去重层前缀
+        json_dict = {}
+        for i, row in enumerate(final_codes_np):
+            tokens = [prefix[j].format(code) for j, code in enumerate(row[:-1])]
+            tokens.append(dedup_prefix.format(row[-1]))
+            json_dict[str(i)] = "".join(tokens)
+
         with open(json_path, 'w') as f:
-             json.dump({str(i): final_codes_np[i].tolist() for i in range(len(final_codes_np))}, f, indent=2)
-        torch.save(torch.from_numpy(final_codes_np.T).contiguous().long(), pt_path)
-        logging.info(f"码本已保存: JSON -> {json_path}, PT -> {pt_path}")
+            json.dump(json_dict, f, indent=2)
+
+        np.save(npy_path, final_codes_np)
+
+        logging.info(f"码本已保存（标准命名）: JSON -> {json_path}, NPY -> {npy_path}")

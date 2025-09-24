@@ -53,9 +53,7 @@ python main.py --quantizer_name rqvae --dataset_name Musical_Instruments --embed
 ```
 cd recommendation
 
-python main.py --category=Baby --model=encoder_decoder
-
-python main.py --category=Musical_Instruments --model=encoder_decoder
+python main.py --dataset_name Beauty --quant_method rqvae
 ```
 
 

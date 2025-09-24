@@ -1,8 +1,4 @@
-
-
-
-
 python amazon18_data_process.py \
-    --dataset Musical_Instruments \
+    --dataset Beauty \
     --input_path ../datasets \
     --output_path ../datasets

@@ -206,15 +206,33 @@ def make_inters_in_order(inters):
             interacted_item.add(inter[1])
             new_inters.append(inter)
     return new_inters
+    
 def convert_inters2dict(inters):
+    """
+    将原始交互映射为 user2items, user2index, item2index。
+    - 用户：按原始 user 字符串排序后编号 0..U-1（稳定、可复现）
+    - 物品：按原始 item 字符串排序后编号 0..I-1（稳定、可复现）
+    不改变时间顺序。
+    """
+    # 1) 收集全集
+    all_users = {u for (u, i, r, t) in inters}
+    all_items = {i for (u, i, r, t) in inters}
+
+    # 2) 稳定排序并建立映射
+    users_sorted = sorted(all_users)
+    items_sorted = sorted(all_items)
+    user2index = {u: idx for idx, u in enumerate(users_sorted)}
+    item2index = {i: idx for idx, i in enumerate(items_sorted)}
+
+    # 3) 逐条交互按时间原序写回（不打乱时间）
     user2items = collections.defaultdict(list)
-    user2index, item2index = dict(), dict()
-    for inter in inters:
-        user, item, rating, timestamp = inter
-        if user not in user2index: user2index[user] = len(user2index)
-        if item not in item2index: item2index[item] = len(item2index)
-        user2items[user2index[user]].append(item2index[item])
+    for u, it, r, ts in inters:
+        uid = user2index[u]
+        iid = item2index[it]
+        user2items[uid].append(iid)
+
     return user2items, user2index, item2index
+
 def generate_data(args, rating_inters):
     print('Split dataset: ')
     print(' Dataset: ', args.dataset)
@@ -228,45 +246,59 @@ def generate_data(args, rating_inters):
         assert len(user2items[u_index]) == len(train_inters[u_index]) + len(valid_inters[u_index]) + len(test_inters[u_index])
     return user2items, train_inters, valid_inters, test_inters, user2index, item2index
 
-def convert_to_atomic_files(args, train_data, valid_data, test_data):
-    print('Convert dataset: ')
+def convert_to_atomic_files(args, train_data, valid_data, test_data, max_history_len=50, use_sliding_window=True):
+    """
+    保存为 JSONL 文件，每行包含三个字段：user, history, target
+    """
+    print('Convert dataset to JSONL:')
     print(' Dataset: ', args.dataset)
+
     uid_list = list(train_data.keys())
     uid_list.sort(key=lambda t: int(t))
 
-    # --- 修改开始 ---
-    # 定义输出的根目录，不再创建子文件夹
     output_dir = os.path.join(args.output_path, args.dataset)
-    # 确保这个根目录存在
     os.makedirs(output_dir, exist_ok=True)
-    # --- 修改结束 ---
 
-    # 保存 train.inter，直接使用 output_dir
-    with open(os.path.join(output_dir, f'{args.dataset}.train.inter'), 'w') as file:
-        file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
+    # --- Train ---
+    train_path = os.path.join(output_dir, f"{args.dataset}.train.jsonl")
+    with open(train_path, 'w') as f:
         for uid in uid_list:
             item_seq = train_data[uid]
             seq_len = len(item_seq)
-            for target_idx in range(1, seq_len):
-                target_item = item_seq[-target_idx]
-                seq = item_seq[:-target_idx][-50:]
-                file.write(f'{uid}\t{" ".join(seq)}\t{target_item}\n')
-    
-    # 保存 valid.inter，直接使用 output_dir
-    with open(os.path.join(output_dir, f'{args.dataset}.valid.inter'), 'w') as file:
-        file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
-        for uid in uid_list:
-            item_seq = train_data[uid][-50:]
-            target_item = valid_data[uid][0]
-            file.write(f'{uid}\t{" ".join(item_seq)}\t{target_item}\n')
 
-    # 保存 test.inter，直接使用 output_dir
-    with open(os.path.join(output_dir, f'{args.dataset}.test.inter'), 'w') as file:
-        file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
+            if use_sliding_window:
+                # 滑动窗口：逐步生成 prefix → target
+                for target_idx in range(1, seq_len):
+                    target_item = item_seq[-target_idx]
+                    seq = item_seq[:-target_idx][-max_history_len:]
+                    json.dump({"user": uid, "history": seq, "target": target_item}, f)
+                    f.write("\n")
+            else:
+                # 只取最后一个
+                target_item = item_seq[-1]
+                seq = item_seq[:-1][-max_history_len:]
+                json.dump({"user": uid, "history": seq, "target": target_item}, f)
+                f.write("\n")
+
+    # --- Valid ---
+    valid_path = os.path.join(output_dir, f"{args.dataset}.valid.jsonl")
+    with open(valid_path, 'w') as f:
         for uid in uid_list:
-            item_seq = (train_data[uid] + valid_data[uid])[-50:]
+            item_seq = train_data[uid][-max_history_len:]
+            target_item = valid_data[uid][0]
+            json.dump({"user": uid, "history": item_seq, "target": target_item}, f)
+            f.write("\n")
+
+    # --- Test ---
+    test_path = os.path.join(output_dir, f"{args.dataset}.test.jsonl")
+    with open(test_path, 'w') as f:
+        for uid in uid_list:
+            item_seq = (train_data[uid] + valid_data[uid])[-max_history_len:]
             target_item = test_data[uid][0]
-            file.write(f'{uid}\t{" ".join(item_seq)}\t{target_item}\n')
+            json.dump({"user": uid, "history": item_seq, "target": target_item}, f)
+            f.write("\n")
+
+    print(f"JSONL files saved to {output_dir}")
 
 def parse_args():
     parser = argparse.ArgumentParser()

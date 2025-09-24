@@ -1,1 +1,0 @@
-{"Loss/train_loss":175.0185089111328,"Val_Metric/recall@5":0.006298110354691744,"Val_Metric/ndcg@5":0.0030284076929092407,"_wandb":{"runtime":72},"Val_Metric/recall@10":0.009097270667552948,"_step":4,"Val_Metric/ndcg@10":0.0039548627100884914,"_timestamp":1.7552377196058602e+09,"_runtime":72.054070237}

@@ -1,150 +1,213 @@
-# /recommendation/dataset.py (最终调试版)
-
-from logging import getLogger
-from datasets import Dataset
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+import json
 import os
-import json # <-- 新增导入
 
-class AbstractDataset:
-    # ... (这部分代码保持不变) ...
-    def __init__(self, config: dict):
-        self.config = config
-        self.accelerator = self.config['accelerator']
-        self.logger = getLogger()
-        self.all_item_seqs = {}
-        self.id_mapping = {'user2id': {}, 'item2id': {}, 'id2user': [], 'id2item': []}
-        self.item2meta = None
-        self.split_data = None
-    def __str__(self) -> str:
-        return (f"[Dataset] {self.__class__.__name__}\n"
-                f"\tNumber of users: {self.n_users}\n"
-                f"\tNumber of items: {self.n_items}\n"
-                f"\tNumber of interactions: {self.n_interactions}\n"
-                f"\tAverage item sequence length: {self.avg_item_seq_len:.2f}")
-    @property
-    def n_users(self) -> int: return len(self.id_mapping['id2user'])
-    @property
-    def n_items(self) -> int: return len(self.id_mapping['id2item'])
-    @property
-    def n_interactions(self) -> int:
-        total = 0
-        for u in self.all_item_seqs: total += len(self.all_item_seqs[u])
-        return total
-    @property
-    def avg_item_seq_len(self) -> float: return self.n_interactions / max(1, len(self.all_item_seqs))
-    def split(self):
-        if self.split_data is None: raise RuntimeError("split() not prepared.")
-        return self.split_data
-    def log(self, message, level='info'):
-        from utils import log
-        return log(message, self.config['accelerator'], self.logger, level=level)
+# -----------------------------
+# 通用工具
+# -----------------------------
+def pad_or_truncate(sequence, max_len, PAD_TOKEN=0):
+    """对 itemID 序列做左侧 pad 或右侧截断"""
+    if len(sequence) > max_len:
+        return sequence[-max_len:]
+    else:
+        return [PAD_TOKEN] * (max_len - len(sequence)) + sequence
+
+def item2code(code_path, vocab_sizes, bases):
+    """
+    将 codebook 的每一行 [c0, c1, c2, dup] 编码为 4 个 token：
+      token_i = raw_i + bases[i] + 1
+    其中 0 留给 PAD。
+    """
+    data = np.load(code_path, allow_pickle=True)
+    mat = np.vstack(data) if data.dtype == object else data
+    assert mat.shape[1] == 4, f"Expect 4 columns in codebook, got {mat.shape[1]}"
+
+    K0, K1, K2, K3 = map(int, vocab_sizes)
+    B0, B1, B2, B3 = map(int, bases)
+
+    item_to_code = {}
+    code_to_item = {}
+
+    for index, row in enumerate(mat):  # 假定 item_id = index + 1
+        c0, c1, c2, dup = map(int, row.tolist())
+
+        # 范围校验
+        if not (0 <= c0 < K0 and 0 <= c1 < K1 and 0 <= c2 < K2 and 0 <= dup < K3):
+            raise ValueError(f"Out-of-range codes {row} with vocab_sizes={vocab_sizes}")
+
+        t0 = c0 + B0 + 1
+        t1 = c1 + B1 + 1
+        t2 = c2 + B2 + 1
+        t3 = dup + B3 + 1
+
+        offsets = [t0, t1, t2, t3]
+        item_id = index + 1
+        item_to_code[item_id] = offsets
+        code_to_item[tuple(offsets)] = item_id
+
+    return item_to_code, code_to_item
 
 
-class InterDataset(AbstractDataset):
-    REQ_FILES = ('train', 'valid', 'test')
 
-    def __init__(self, config: dict):
-        super().__init__(config)
-        self.logger = getLogger()
-        self.category = config.get('category')
-        self.data_dir = config.get('data_dir', '../datasets')
-        if not self.category:
-            raise ValueError("[InterDataset] config['category'] is required.")
+# -----------------------------
+# Parquet 读取（原逻辑）
+# -----------------------------
+def process_parquet(file_path, mode, max_len, PAD_TOKEN=0):
+    """
+    从 parquet 读取，支持 train(滑动窗口)/evaluation(只取最后一个 target)
+    期望 parquet 内已有列：history(list[int])、target(int)
+    """
+    df = pd.read_parquet(file_path)
+    df['sequence'] = df['history'].apply(lambda x: list(x)) + df['target'].apply(lambda x: [x])
 
-        split2rows = {}
-        raw_user_set, raw_item_set = set(), set()
+    processed_data = []
+    if mode == 'train':
+        # 滑动窗口
+        for row in df.itertuples(index=False):
+            sequence = row.sequence
+            for i in range(1, len(sequence)):
+                processed_data.append({
+                    'history': pad_or_truncate(sequence[:i], max_len, PAD_TOKEN),
+                    'target': sequence[i]
+                })
+    elif mode == 'evaluation':
+        for row in df.itertuples(index=False):
+            sequence = row.sequence
+            processed_data.append({
+                'history': pad_or_truncate(sequence[:-1], max_len, PAD_TOKEN),
+                'target': sequence[-1]
+            })
+    else:
+        raise ValueError("Mode must be 'train' or 'evaluation'.")
+    return processed_data
 
-        for split in self.REQ_FILES:
-            path = os.path.join(self.data_dir, self.category, f"{self.category}.{split}.inter")
-            # 兼容 valid / val
-            if not os.path.exists(path) and split == 'valid':
-                alt = os.path.join(self.data_dir, self.category, f"{self.category}.val.inter")
-                if os.path.exists(alt): path = alt
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"[InterDataset] Not found: {path}")
+# -----------------------------
+# JSONL 读取（新增）
+# -----------------------------
+def process_jsonl(file_path, max_len, PAD_TOKEN=0):
+    """
+    从 JSONL 读取，每行：{"user": int, "history": [itemIDs], "target": int}
+    不做滑动窗口，默认已展开。
+    """
+    processed = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            # ✅ 关键：字符串 -> int；且本数据是 0 基
+            history = [int(x) for x in obj.get("history", [])]
+            target = int(obj.get("target"))
+            processed.append({
+                "history": pad_or_truncate(history, max_len, PAD_TOKEN),
+                "target": target
+            })
+    return processed
 
-            rows = []
-            with open(path, 'r', encoding='utf-8') as f:
-                header_raw = f.readline()
-                if not header_raw:
-                    raise ValueError(f"[InterDataset] Empty file: {path}")
-                header = header_raw.strip().lstrip('\ufeff')  # 处理 BOM
 
-                # —— 检测列分隔符（优先 \t，否则用“两个及以上空格”）——
-                if '\t' in header:
-                    delim = '\t'
-                    cols = header.split('\t')
-                else:
-                    delim = None  # 用 regex: 两个及以上空格
-                    cols = re.split(r'\s{2,}', header.strip())
+# -----------------------------
+# 统一 Dataset
+# -----------------------------
+class GenRecDataset(Dataset):
+    def __init__(self, dataset_path, code_path, mode, max_len, PAD_TOKEN=0,
+                 vocab_sizes=None, bases=None, input_format=None):
+        self.dataset_path = dataset_path
+        self.code_path = code_path
+        self.mode = mode
+        self.max_len = max_len
+        self.PAD_TOKEN = PAD_TOKEN
 
-                # 基于列名建立索引（顺序可以变）
-                name2idx = {c.strip(): i for i, c in enumerate(cols)}
-                required = ['user_id:token', 'item_id_list:token_seq', 'item_id:token']
-                for need in required:
-                    if need not in name2idx:
-                        raise ValueError(f"[InterDataset] Missing column '{need}' in header of {path}: {header}")
+        assert vocab_sizes is not None and bases is not None, \
+            "Must pass vocab_sizes and bases from main.py"
+        self.vocab_sizes = vocab_sizes
+        self.bases = bases
+        self.num_levels = len(self.vocab_sizes)  # ✅ 补上
 
-                # —— 逐行解析 —— #
-                for ln, raw in enumerate(f, start=2):
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    try:
-                        parts = line.split('\t') if delim == '\t' else re.split(r'\s{2,}', line)
-                        # 有些文件可能存在对齐异常，兜底：用“首列 + 末列 + 中间合并”为三列
-                        if len(parts) < 3:
-                            toks = line.split()
-                            if len(toks) < 3:
-                                raise ValueError(f"无法切成3列: '{line[:200]}'")
-                            c0 = toks[0]
-                            c2 = toks[-1]
-                            c1 = ' '.join(toks[1:-1])
-                        else:
-                            # 按列名取对应字段
-                            c0 = parts[name2idx['user_id:token']].strip()
-                            c1 = parts[name2idx['item_id_list:token_seq']].strip()
-                            c2 = parts[name2idx['item_id:token']].strip()
 
-                        u_raw = int(c0)
-                        seq_raw = [int(x) for x in c1.split()] if c1 else []
-                        tgt_raw = int(c2)
-                    except Exception as e:
-                        # 明确指出是“列分隔符/脏行”问题，不中断整个数据集
-                        self.log(f"警告: 解析文件 {path} 第 {ln} 行失败: {e} | 内容: '{line}'", level='warning')
-                        continue
+        # 加载 codebook 映射（按位偏移编码）
+        self.item_to_code, self.code_to_item = item2code(
+            code_path, vocab_sizes=self.vocab_sizes, bases=self.bases
+        )
 
-                    if len(seq_raw) == 0:
-                        # 纯冷启动样本，通常对自回归训练无用，默认跳过（需要可改成保留）
-                        continue
+        # 自动判断/显式指定输入格式
+        if input_format is None:
+            ext = os.path.splitext(dataset_path)[1].lower()
+            if ext == ".jsonl":
+                input_format = "jsonl"
+            elif ext == ".parquet":
+                input_format = "parquet"
+            else:
+                raise ValueError(f"Unknown file extension for dataset_path: {dataset_path}")
 
-                    rows.append((u_raw, seq_raw, tgt_raw))
-                    raw_user_set.add(u_raw)
-                    raw_item_set.update(seq_raw); raw_item_set.add(tgt_raw)
+        self.input_format = input_format
 
-            split2rows[split] = rows
+        # 预处理
+        if self.input_format == "jsonl":
+            # JSONL 不需要 mode；不滑窗
+            processed = process_jsonl(
+                self.dataset_path, self.max_len, self.PAD_TOKEN
+            )
+        elif self.input_format == "parquet":
+            processed = process_parquet(
+                self.dataset_path, self.mode, self.max_len, self.PAD_TOKEN
+            )
+        else:
+            raise ValueError("input_format must be 'jsonl' or 'parquet'.")
 
-        # —— 构建映射（内部ID == 原始ID；键用字符串，便于与你现有 Tokenizer 对齐） —— #
-        self.id_mapping['id2user'] = [str(u) for u in sorted(raw_user_set)]
-        self.id_mapping['user2id'] = {str(u): u for u in sorted(raw_user_set)}
-        self.id_mapping['id2item'] = [str(i) for i in sorted(raw_item_set)]
-        self.id_mapping['item2id'] = {str(i): i for i in sorted(raw_item_set)}
-        self.id_mapping['raw_item2id'] = {i: i for i in sorted(raw_item_set)}
-        self.id_mapping['id2raw_item'] = {i: i for i in sorted(raw_item_set)}
+        # itemID -> code 映射
+        self.data = []
+        for item in processed:
+            hist_ids = item['history']
+            tgt_id = item['target']
 
-        # —— 组装 HF Datasets（每行一个样本：历史+目标） —— #
-        dict_splits = {s: {'user': [], 'item_seq': []} for s in ('train', 'valid', 'test')}
-        for split, rows in split2rows.items():
-            for (u_raw, seq_raw, tgt_raw) in rows:
-                dict_splits[split]['user'].append(str(u_raw))
-                dict_splits[split]['item_seq'].append([str(x) for x in (seq_raw + [tgt_raw])])
+            # 把每个 itemID 映射成 num_levels 长度的 code 列表
+            hist_codes = [
+                self.item_to_code.get(int(x) + 1, [self.PAD_TOKEN]*self.num_levels) for x in hist_ids
+            ]
+            tgt_code = self.item_to_code.get(int(tgt_id) + 1, [self.PAD_TOKEN]*self.num_levels)
 
-        for split in dict_splits:
-            dict_splits[split] = Dataset.from_dict(dict_splits[split])
-        self.split_data = dict_splits
 
-        # —— 打印基本信息 —— #
-        max_uid = max(raw_user_set) if raw_user_set else -1
-        max_iid = max(raw_item_set) if raw_item_set else -1
-        self.log(f"[InterDataset] 成功解析 .inter | users={len(raw_user_set)}, items={len(raw_item_set)}, "
-                 f"max_user_id={max_uid}, max_item_id={max_iid}")
+            self.data.append({
+                'history': hist_codes,   # [[l1,l2,...], [l1,l2,...], ...]
+                'target': tgt_code       # [t1,t2,...]
+            })
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+    def __len__(self):
+        return len(self.data)
+
+
+# --------------- 简单自测 ---------------
+if __name__ == "__main__":
+    # JSONL 示例
+    # 假设 ../data/Beauty/train.jsonl 存在，每行 {user, history, target}
+    ds_jsonl = GenRecDataset(
+        dataset_path='/home/wj/peiyu/GenRec/MM-RQVAE/datasets/Musical_Instruments/Musical_Instruments.train.jsonl',
+        code_path='/home/wj/peiyu/GenRec/MM-RQVAE/datasets/Musical_Instruments/Musical_Instruments.emb-qwen-td.npy',
+        mode='train',                 # JSONL 时忽略
+        max_len=20,
+        input_format='jsonl',         # 可省略，按后缀自动判断
+        codebook_size=256,
+        num_levels=3
+    )
+    print("JSONL len:", len(ds_jsonl))
+    print("Sample:", ds_jsonl[0])
+
+    # Parquet 示例（保持原行为）
+    # ds_parquet = GenRecDataset(
+    #     dataset_path='../data/Beauty/train.parquet',
+    #     code_path='../data/Beauty/Beauty_t5_rqvae.npy',
+    #     mode='train',
+    #     max_len=20,
+    #     input_format='parquet',
+    #     codebook_size=256,
+    #     num_levels=3
+    # )
+    # print("Parquet len:", len(ds_parquet))
+    # print("Sample:", ds_parquet[0])

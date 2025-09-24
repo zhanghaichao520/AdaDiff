@@ -54,44 +54,49 @@ def generate_item_embedding(args, item_text_list, tokenizer, model, word_drop_ra
         assert text != [0]
 
     embeddings = []
-    start, batch_size = 0, 1
+    start = 0
+    batch_size = args.batch_size  # ✅ 使用参数
     with torch.no_grad():
-        # 使用 tqdm 替代手动打印进度
         pbar = tqdm(total=len(order_texts), desc="生成嵌入", ncols=100)
         while start < len(order_texts):
-            field_texts = order_texts[start: start + batch_size]
-            field_texts = zip(*field_texts)
-    
+            field_texts = order_texts[start: start + batch_size]  # ✅ 批切片
+            field_texts = zip(*field_texts)  # 这里保持你原来的“对每个字段分别前向，再求均值”的逻辑
+
             field_embeddings = []
             for sentences in field_texts:
                 sentences = list(sentences)
                 if word_drop_ratio > 0:
                     new_sentences = []
                     for sent in sentences:
-                        new_sent = []
-                        sent = sent.split(' ')
-                        for wd in sent:
-                            if random.random() > word_drop_ratio:
-                                new_sent.append(wd)
-                        new_sent = ' '.join(new_sent)
-                        new_sentences.append(new_sent)
+                        toks = sent.split(' ')
+                        kept = [wd for wd in toks if random.random() > word_drop_ratio]
+                        new_sentences.append(' '.join(kept) if kept else sent)
                     sentences = new_sentences
-                
-                encoded_sentences = tokenizer(sentences, max_length=args.max_sent_len,
-                                              truncation=True, return_tensors='pt', padding="longest").to(args.device)
-                outputs = model(input_ids=encoded_sentences.input_ids,
-                                attention_mask=encoded_sentences.attention_mask)
-    
-                masked_output = outputs.last_hidden_state * encoded_sentences['attention_mask'].unsqueeze(-1)
-                mean_output = masked_output.sum(dim=1) / encoded_sentences['attention_mask'].sum(dim=-1, keepdim=True)
-                mean_output = mean_output.detach().cpu()
-                field_embeddings.append(mean_output)
-    
+
+                encoded = tokenizer(
+                    sentences,
+                    max_length=args.max_sent_len,
+                    truncation=True,
+                    return_tensors='pt',
+                    padding="longest"
+                ).to(args.device)
+
+                outputs = model(
+                    input_ids=encoded.input_ids,
+                    attention_mask=encoded.attention_mask
+                )
+
+                masked = outputs.last_hidden_state * encoded['attention_mask'].unsqueeze(-1)
+                mean_output = masked.sum(dim=1) / encoded['attention_mask'].sum(dim=-1, keepdim=True)
+                field_embeddings.append(mean_output.detach().cpu())
+
             field_mean_embedding = torch.stack(field_embeddings, dim=0).mean(dim=0)
             embeddings.append(field_mean_embedding)
-            start += batch_size
-            pbar.update(batch_size)
+
+            start += batch_size               # ✅ 用 batch_size 前进
+            pbar.update(field_mean_embedding.size(0))  # ✅ 更精确地按实际样本数更新
         pbar.close()
+
 
     embeddings = torch.cat(embeddings, dim=0).numpy()
     print('原始嵌入维度: ', embeddings.shape)
@@ -139,7 +144,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='Instruments', help='Instruments / Arts / Games')
     parser.add_argument('--root', type=str, default="../datasets")
-    parser.add_argument('--gpu_id', type=int, default=0, help='ID of running GPU')
+    parser.add_argument('--gpu_id', type=int, default=7, help='ID of running GPU')
+    parser.add_argument('--batch_size', type=int, default=256, help='批量生成文本嵌入的 batch size')
     parser.add_argument('--plm_name', type=str, default='llama')
     parser.add_argument('--model_name_or_path', type=str, default='huggyllama/llama-7b')
     parser.add_argument('--model_cache_dir', type=str, default='/userhome/cache_models')

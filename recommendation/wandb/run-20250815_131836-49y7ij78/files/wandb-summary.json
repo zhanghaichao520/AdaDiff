@@ -1,1 +1,0 @@
-{"Loss/train_loss":NaN,"Val_Metric/recall@5":0,"Test_Periodic_Metric/recall@5":0,"Test_Periodic_Metric/ndcg@10":0,"Test_Periodic_Metric/recall@10":0,"Val_Metric/ndcg@5":0,"Test_Periodic_Metric/ndcg@5":0,"Val_Metric/recall@10":0,"_runtime":17.437539982,"_step":10,"_wandb":{"runtime":17},"_timestamp":1.7552351336040647e+09,"Val_Metric/ndcg@10":0}
