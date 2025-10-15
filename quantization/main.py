@@ -18,7 +18,7 @@ from trainer import Trainer
 def main():
     parser = argparse.ArgumentParser(description="通用量化器训练脚本")
     
-    parser.add_argument('--model_name', type=str, required=True, choices=['rqvae'], help='要使用的量化器模型名称。')
+    parser.add_argument('--model_name', type=str, required=True, choices=['rqvae','rkmeans'], help='要使用的量化器模型名称。')
     parser.add_argument('--dataset_name', type=str, required=True, help='数据集名称 (e.g., Baby)')
     parser.add_argument('--embedding_suffix', type=str, required=True, help='嵌入文件名后缀 (e.g., td)')
     

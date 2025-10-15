@@ -45,7 +45,7 @@ cd quantization
 python main.py --quantizer_name rqvae --dataset_name Beauty --embedding_suffix "fused-concat"
 
 # 纯文本
-python main.py --quantizer_name rqvae --dataset_name Musical_Instruments --embedding_suffix "td"
+python main.py --dataset_name Musical_Instruments --embedding_suffix "td" --model_name rqvae
 ```
 
 ### Train Recommendation
@@ -53,7 +53,7 @@ python main.py --quantizer_name rqvae --dataset_name Musical_Instruments --embed
 ```
 cd recommendation
 
-python main.py --dataset_name Beauty --quant_method rqvae
+python main.py --dataset_name Musical_Instruments --quant_method rqvae
 ```
 
 

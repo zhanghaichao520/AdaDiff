@@ -34,69 +34,67 @@ class Trainer:
         train_loader = DataLoader(train_dataset, batch_size=self.train_params['batch_size'], shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=self.train_params['batch_size'])
         
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.train_params['lr'])
+        # 只对需要梯度的模型启用 optimizer
+        optimizer = None
+        if self.model_name != "rkmeans":
+            optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.train_params['lr'])
+        
         best_val_loss = float('inf')
         best_model_path = os.path.join(ckpt_dir, "best_model.pth")
-        
-        num_epochs = self.train_params.get('epochs', 100) # 从配置获取epochs
+        num_epochs = self.train_params.get('epochs', 100)
         
         for epoch in tqdm(range(num_epochs), desc=f"训练 {self.model_name}"):
             self.model.train()
             for batch_data in train_loader:
                 batch_data = batch_data.to(self.device)
-                optimizer.zero_grad()
+                if optimizer:
+                    optimizer.zero_grad()
+
                 forward_outputs = self.model(batch_data)
                 loss_dict = self.model.compute_loss(forward_outputs, batch_data)
                 loss = loss_dict['loss_total']
-                loss.backward()
-                optimizer.step()
+
+                if self.model_name == "rkmeans":
+                    # RKMEANS 内部已做 mini-batch 更新，这里只统计 loss
+                    loss_val = loss.item() if torch.is_tensor(loss) else float(loss)
+                else:
+                    # 需要梯度的模型（如 rqvae）
+                    loss.backward()
+                    optimizer.step()
+                    loss_val = loss.item()
             
-            # --- 验证循环 (已增强) ---
+            # --- 验证循环 ---
             eval_interval = self.train_params.get('eval_interval', 100)
             if (epoch + 1) % eval_interval == 0:
                 self.model.eval()
-                # --- 核心改动 1：初始化用于累加详细损失的变量 ---
                 total_val_loss, total_val_recon, total_val_latent = 0, 0, 0
-                
                 with torch.no_grad():
                     for batch_data in val_loader:
                         batch_data = batch_data.to(self.device)
                         forward_outputs = self.model(batch_data)
                         loss_dict = self.model.compute_loss(forward_outputs, batch_data)
-                        
-                        # --- 核心改动 1：累加所有损失项 ---
                         total_val_loss += loss_dict['loss_total'].item()
                         if 'loss_recon' in loss_dict:
                             total_val_recon += loss_dict['loss_recon'].item()
                         if 'loss_latent' in loss_dict:
                             total_val_latent += loss_dict['loss_latent'].item()
 
-                # 计算平均值
                 avg_val_loss = total_val_loss / len(val_loader)
                 avg_val_recon = total_val_recon / len(val_loader)
                 avg_val_latent = total_val_latent / len(val_loader)
-                
-                # 打印增强后的日志
-                logging.info(f"[VAL] Epoch {epoch+1:04d} | Total Loss: {avg_val_loss:.4f} (Recon: {avg_val_recon:.4f}, Latent: {avg_val_latent:.4f})")
+                logging.info(f"[VAL] Epoch {epoch+1:04d} | Total Loss: {avg_val_loss:.4f} "
+                             f"(Recon: {avg_val_recon:.4f}, Latent: {avg_val_latent:.4f})")
 
-                # --- 核心改动 2：加入余弦相似度计算 ---
-                # 从验证集中取一个batch的数据用于计算
+                # 指标监控（cosine 相似度、活跃 code、熵、碰撞率）
                 val_sample_data = next(iter(val_loader)).to(self.device)
                 cos_sim_array = utils.calc_cos_sim(self.model, val_sample_data, self.model_config['model_params'])
                 logging.info(f"[VAL] Cosine Similarity per level: {np.round(cos_sim_array, 4)}")
-                # --- 改动结束 ---
 
-                                # --- 核心改动 3：更多指标 ---
                 with torch.no_grad():
-                    # 获取一个 batch 的离散编码
                     val_codes = self.model.get_codes(val_sample_data).detach().cpu().numpy()
                     num_levels = val_codes.shape[1]
-
-                    # 1. 每层活跃 code 数量
                     active_counts = [len(np.unique(val_codes[:, i])) for i in range(num_levels)]
                     logging.info(f"[VAL] Active codes per level: {active_counts}")
-
-                    # 2. 每层 code 使用分布熵（衡量利用均匀度）
                     usage_entropy = []
                     for i in range(num_levels):
                         unique, counts = np.unique(val_codes[:, i], return_counts=True)
@@ -104,13 +102,9 @@ class Trainer:
                         entropy = -np.sum(probs * np.log2(probs + 1e-9))
                         usage_entropy.append(round(float(entropy), 4))
                     logging.info(f"[VAL] Code usage entropy per level: {usage_entropy}")
-
-                    # 3. 碰撞率（完全相同的 code 行数 / 总数）
                     unique_rows = np.unique(val_codes, axis=0).shape[0]
                     collision_rate = 1 - unique_rows / val_codes.shape[0]
                     logging.info(f"[VAL] Collision rate (batch): {collision_rate:.4f}")
-                # --- 改动结束 ---
-
 
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss

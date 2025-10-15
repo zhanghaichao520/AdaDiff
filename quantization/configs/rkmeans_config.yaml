@@ -1,0 +1,37 @@
+eval_interval: 50
+
+common:
+  device: 'cuda:0'
+
+rkmeans:
+  model_params:
+    code_dim: 512            # = 你的 embedding 列数
+    num_levels: 3            # = num_hierarchies
+    codebook_size: 256       # = codebook_width
+    distance: "cosine"       # "euclidean" 也可
+    normalize_residuals: true
+    train_layer_wise: true
+    init_buffer_size: 3072   # 先攒够这一批 residual 再做每层 KMeans++ 初始化
+    track_residuals: false
+
+  training_params:
+    # mini-batch KMeans 的更新方式
+    update_mode: "sgd_like"  # 或 "ema"
+    mb_lr: 0.5               # 对应他们的 SGD(lr=0.5)
+    ema_decay: 0.95
+
+    # 每层训练多少个 batch 后切到下一层
+    level_train_steps: 200
+
+    # 空簇重启
+    reseed_empty: true
+
+    # 使用度正则（可选：提高码本利用率）
+    usage_reg: true
+    usage_reg_weights: [0.005, 0.02, 0.04]
+
+    batch_size: 512
+    epochs: 300              # 不用 1000，几百轮足够
+    lr: 0.0                  # 不靠优化器更新质心，设 0
+    weight_decay: 0.0
+    optimizer: "AdamW"       # 填什么都行，不会动到 codebook
