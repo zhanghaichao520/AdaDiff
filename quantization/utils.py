@@ -52,29 +52,34 @@ def get_model(model_name: str):
         )
         
     return model_class
-def setup_paths(args):
-    """根据输入参数构建所有需要的路径"""
-    input_embedding_filename = f"{args.dataset_name}.emb-{args.embedding_suffix}.npy"
-    embedding_path = os.path.join(args.data_base_path, args.dataset_name, input_embedding_filename)
     
-    # 输出目录现在包含量化器名称和特征后缀，实现完全隔离
-    output_base_dir = f"{args.model_name}/{args.embedding_suffix}"
+def setup_paths(args):
+    """根据输入参数构建所有需要的路径（新版兼容模态+模型）"""
+    emb_dir = os.path.join(args.data_base_path, args.dataset_name, "embeddings")
+    os.makedirs(emb_dir, exist_ok=True)
+
+    # ✅ 统一 embedding 文件命名规范
+    embedding_filename = f"{args.dataset_name}.emb-{args.embedding_modality}-{args.embedding_model}.npy"
+    embedding_path = os.path.join(emb_dir, embedding_filename)
+
+    # ✅ 输出目录：包含量化器和embedding来源，确保隔离
+    output_base_dir = f"{args.model_name}/{args.embedding_modality}-{args.embedding_model}"
     log_dir = os.path.join(args.log_base_path, args.dataset_name, output_base_dir)
     ckpt_dir = os.path.join(args.ckpt_base_path, args.dataset_name, output_base_dir)
-    codebook_dir = os.path.join(args.codebook_base_path, args.dataset_name)
+    codebook_dir = os.path.join(args.codebook_base_path, args.dataset_name, "codebooks")
 
     for d in [log_dir, ckpt_dir, codebook_dir]:
         os.makedirs(d, exist_ok=True)
-        
-    print("--- 自动构建路径 (模块化版) ---")
-    print(f"输入特征: {embedding_path}")
-    print(f"配置文件: {args.config_path}")
+
+    print("--- 自动构建路径 ---")
+    print(f"输入嵌入文件: {embedding_path}")
     print(f"日志目录: {log_dir}")
     print(f"模型目录: {ckpt_dir}")
     print(f"码本目录: {codebook_dir}")
     print("------------------------------------\n")
 
     return embedding_path, log_dir, ckpt_dir, codebook_dir
+
 
 def setup_logging(log_dir):
     """配置日志记录器"""

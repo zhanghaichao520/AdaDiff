@@ -32,3 +32,12 @@ class AbstractVQ(nn.Module, ABC):
         计算损失函数，必须返回一个包含 'loss_total'键的字典。
         """
         pass
+
+    @property
+    def is_iterative(self) -> bool:
+        """
+        模型自我聲明其訓練範式。
+        - True (預設): 需要迭代訓練 (e.g., VQ-VAE)。
+        - False: 只需要一次性擬合 (e.g., OPQ, PQ)。
+        """
+        return True # 預設所有模型都需要迭代訓練

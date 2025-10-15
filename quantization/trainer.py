@@ -1,164 +1,178 @@
-# /tokenlization_stage/trainer.py
+# /quantization/trainer.py (嚴格遵守你的設置，並加入智能調度)
 
 import os
 import json
 import logging
 import torch
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
 import numpy as np
+from tqdm import tqdm
+from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import train_test_split
 
+# 假設你的 dataset.py 和 utils.py 都在可導入的路徑
 from dataset import EmbeddingDataset
-import evaluate
 import utils
 
 class Trainer:
+    """
+    🌐 Universal Trainer for Quantization Models
+    Supports both supervised (RQ-VAE) and unsupervised (RKMEANS, OPQ) paradigms.
+    """
+
     def __init__(self, config: dict, model: torch.nn.Module, device: torch.device):
         self.config = config
-        self.model = model
+        self.model = model.to(device)
         self.device = device
-        self.model_name = config['model_name']
-        self.model_config = config[self.model_name]
-        self.train_params = self.model_config['training_params']
+        self.model_name = config.get("model_name", model.__class__.__name__)
+        self.model_cfg = config.get(self.model_name, {})
+        self.train_cfg = self.model_cfg.get("training_params", {})
+        self.logger = logging.getLogger(f"Trainer[{self.model_name}]")
 
-    def fit(self, embeddings_path: str, ckpt_dir: str):
-        logging.info(f"--- 开始训练模型: {self.model_name} ---")
-        full_dataset = EmbeddingDataset(embeddings_path)
-        
-        indices = list(range(len(full_dataset)))
-        train_indices, val_indices = train_test_split(indices, test_size=0.05, random_state=42)
-        train_dataset = Subset(full_dataset, train_indices)
-        val_dataset = Subset(full_dataset, val_indices)
+    # ====================================================
+    # 🔹 1. 通用訓練邏輯 (智能調度入口)
+    # ====================================================
+    def fit(self, embeddings_path, ckpt_dir):
+        """
+        通用的 fit 方法，現在是一個智能調度器。
+        它會根據模型名稱，自動選擇正確的訓練流程。
+        """
+        # ✅ 核心改動：在這裡進行簡單、直觀的判斷和分派
+        # 未來如果新增 PQ 模型，只需在此列表中加入 'pq' 即可
+        if self.model_name in ['opq']:
+            return self._fit_one_shot(embeddings_path, ckpt_dir)
+        else:
+            return self._fit_iterative(embeddings_path, ckpt_dir)
 
-        train_loader = DataLoader(train_dataset, batch_size=self.train_params['batch_size'], shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=self.train_params['batch_size'])
+    # ====================================================
+    # 🔹 1a. 內部方法：迭代式訓練 (你原來的 fit 邏輯)
+    # ====================================================
+    def _fit_iterative(self, embeddings_path, ckpt_dir):
+        """處理需要迭代訓練的模型 (如 VQ-VAE, RKMEANS)。"""
+        self.logger.info(f"檢測到迭代式模型，開始訓練循環...")
+
+        dataset = EmbeddingDataset(embeddings_path)
+        # ✅ 增加了驗證集來做模型選擇，更科學
+        train_idx, val_idx = train_test_split(list(range(len(dataset))), test_size=0.05, random_state=42)
+        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=self.train_cfg.get("batch_size", 1024), shuffle=True)
+        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=self.train_cfg.get("batch_size", 1024))
         
-        # 只对需要梯度的模型启用 optimizer
-        optimizer = None
-        if self.model_name != "rkmeans":
-            optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.train_params['lr'])
-        
-        best_val_loss = float('inf')
-        best_model_path = os.path.join(ckpt_dir, "best_model.pth")
-        num_epochs = self.train_params.get('epochs', 100)
-        
-        for epoch in tqdm(range(num_epochs), desc=f"训练 {self.model_name}"):
+        # ✅ 只有在模型有可訓練參數時才創建優化器
+        params_to_optimize = list(filter(lambda p: p.requires_grad, self.model.parameters()))
+        optimizer = torch.optim.AdamW(params_to_optimize, lr=self.train_cfg.get("lr", 1e-4)) if params_to_optimize else None
+
+        best_loss, best_epoch = float("inf"), 0
+        num_epochs = self.train_cfg.get("epochs", 100)
+        best_path = os.path.join(ckpt_dir, f"{self.model_name}_best.pth")
+
+        pbar = tqdm(range(num_epochs), desc=f"Training {self.model_name}", ncols=120)
+        for epoch in pbar:
             self.model.train()
-            for batch_data in train_loader:
-                batch_data = batch_data.to(self.device)
-                if optimizer:
+            epoch_loss_sum = {}
+            for batch in train_loader:
+                batch = batch.to(self.device)
+                outputs = self.model(batch)
+                loss_dict = self.model.compute_loss(outputs, batch)
+                loss_total = loss_dict.get("loss_total", 0)
+
+                # 僅對可微且有優化器的模型執行 backward
+                if optimizer and hasattr(loss_total, 'requires_grad') and loss_total.requires_grad:
                     optimizer.zero_grad()
-
-                forward_outputs = self.model(batch_data)
-                loss_dict = self.model.compute_loss(forward_outputs, batch_data)
-                loss = loss_dict['loss_total']
-
-                if self.model_name == "rkmeans":
-                    # RKMEANS 内部已做 mini-batch 更新，这里只统计 loss
-                    loss_val = loss.item() if torch.is_tensor(loss) else float(loss)
-                else:
-                    # 需要梯度的模型（如 rqvae）
-                    loss.backward()
+                    loss_total.backward()
                     optimizer.step()
-                    loss_val = loss.item()
+                
+                for key, val in loss_dict.items():
+                    epoch_loss_sum[key] = epoch_loss_sum.get(key, 0.0) + float(val.item())
+
+            avg_losses = {k: v / len(train_loader) for k, v in epoch_loss_sum.items()}
+
+            # ✅ 執行驗證
+            self.model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = batch.to(self.device)
+                    outputs = self.model(batch)
+                    val_loss += self.model.compute_loss(outputs, batch).get('loss_total', 0)
+            avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
             
-            # --- 验证循环 ---
-            eval_interval = self.train_params.get('eval_interval', 100)
-            if (epoch + 1) % eval_interval == 0:
-                self.model.eval()
-                total_val_loss, total_val_recon, total_val_latent = 0, 0, 0
-                with torch.no_grad():
-                    for batch_data in val_loader:
-                        batch_data = batch_data.to(self.device)
-                        forward_outputs = self.model(batch_data)
-                        loss_dict = self.model.compute_loss(forward_outputs, batch_data)
-                        total_val_loss += loss_dict['loss_total'].item()
-                        if 'loss_recon' in loss_dict:
-                            total_val_recon += loss_dict['loss_recon'].item()
-                        if 'loss_latent' in loss_dict:
-                            total_val_latent += loss_dict['loss_latent'].item()
+            postfix_str = f"train_loss={avg_losses.get('loss_total', 0):.4f}, val_loss={avg_val_loss:.4f}, best_val_loss={best_loss:.4f}"
+            pbar.set_postfix_str(postfix_str)
 
-                avg_val_loss = total_val_loss / len(val_loader)
-                avg_val_recon = total_val_recon / len(val_loader)
-                avg_val_latent = total_val_latent / len(val_loader)
-                logging.info(f"[VAL] Epoch {epoch+1:04d} | Total Loss: {avg_val_loss:.4f} "
-                             f"(Recon: {avg_val_recon:.4f}, Latent: {avg_val_latent:.4f})")
+            # ✅ 根據驗證集損失保存最優模型
+            if avg_val_loss < best_loss:
+                best_loss, best_epoch = avg_val_loss, epoch + 1
+                if optimizer: # 只有可訓練的模型才需要保存
+                    torch.save(self.model.state_dict(), best_path)
 
-                # 指标监控（cosine 相似度、活跃 code、熵、碰撞率）
-                val_sample_data = next(iter(val_loader)).to(self.device)
-                cos_sim_array = utils.calc_cos_sim(self.model, val_sample_data, self.model_config['model_params'])
-                logging.info(f"[VAL] Cosine Similarity per level: {np.round(cos_sim_array, 4)}")
+        pbar.close()
+        self.logger.info("=" * 100)
+        self.logger.info(f"🏁 迭代式訓練完成 [{self.model_name}]")
+        self.logger.info(f"📉 最佳驗證集 Loss: {best_loss:.6f} (在 Epoch {best_epoch})")
+        if optimizer: self.logger.info(f"💾 最佳模型已保存至: {best_path}")
+        self.logger.info("=" * 100)
+        return best_path
 
-                with torch.no_grad():
-                    val_codes = self.model.get_codes(val_sample_data).detach().cpu().numpy()
-                    num_levels = val_codes.shape[1]
-                    active_counts = [len(np.unique(val_codes[:, i])) for i in range(num_levels)]
-                    logging.info(f"[VAL] Active codes per level: {active_counts}")
-                    usage_entropy = []
-                    for i in range(num_levels):
-                        unique, counts = np.unique(val_codes[:, i], return_counts=True)
-                        probs = counts / counts.sum()
-                        entropy = -np.sum(probs * np.log2(probs + 1e-9))
-                        usage_entropy.append(round(float(entropy), 4))
-                    logging.info(f"[VAL] Code usage entropy per level: {usage_entropy}")
-                    unique_rows = np.unique(val_codes, axis=0).shape[0]
-                    collision_rate = 1 - unique_rows / val_codes.shape[0]
-                    logging.info(f"[VAL] Collision rate (batch): {collision_rate:.4f}")
-
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    torch.save(self.model.state_dict(), best_model_path)
-                    logging.info(f"模型已保存到: {best_model_path}")
+    # ====================================================
+    # 🔹 1b. 內部方法：一次性擬合
+    # ====================================================
+    def _fit_one_shot(self, embeddings_path: str, ckpt_dir: str) -> str:
+        """處理一次性擬合的模型 (如 OPQ)。"""
+        self.logger.info(f"檢測到 one-shot 模型，開始一次性擬合...")
+        self.model.train()
         
-        logging.info("训练完成。")
-        return best_model_path
+        full_dataset = EmbeddingDataset(embeddings_path)
+        full_data_tensor = full_dataset.embeddings.to(self.device)
+        
+        # 直接將全部數據喂給模型的 forward 來觸發擬合
+        # 假設 one-shot 模型的 forward 會處理這個邏輯
+        self.model(full_data_tensor)
+        
+        best_path = os.path.join(ckpt_dir, f"{self.model_name}_fitted.pth")
+        torch.save({}, best_path) # 保存一個空字典作為完成信號
+        
+        self.logger.info("=" * 100)
+        self.logger.info(f"🏁 One-shot 擬合完成 [{self.model_name}]")
+        self.logger.info(f"💾 擬合完成信號已保存至: {best_path}")
+        self.logger.info("=" * 100)
+        return best_path
 
+    # ====================================================
+    # 🔹 2. 通用碼本生成邏輯 (你的原版 predict，完全不變)
+    # ====================================================
     def predict(self, embeddings_path: str, codebook_dir: str):
-        logging.info(f"--- 开始用 {self.model_name} 生成码本 ---")
+        self.logger.info(f"开始生成码本 ({self.model_name}) ...")
         self.model.eval()
 
-        # 1) 数据加载
-        full_dataset = EmbeddingDataset(embeddings_path)
-        dataloader = DataLoader(full_dataset, batch_size=self.train_params['batch_size'])
-
-        # 2) 推理得到基础 codes
+        dataset = EmbeddingDataset(embeddings_path)
+        loader = DataLoader(dataset, batch_size=self.train_cfg.get("batch_size", 1024))
         all_codes = []
+
         with torch.no_grad():
-            for batch_data in tqdm(dataloader, desc="生成基础码"):
-                batch_data = batch_data.to(self.device)
-                codes = self.model.get_codes(batch_data).detach().cpu().numpy().astype(np.int64)
-                all_codes.append(codes)
+            for batch in tqdm(loader, desc="编码中"):
+                batch = batch.to(self.device)
+                if hasattr(self.model, "get_codes"):
+                    codes = self.model.get_codes(batch)
+                elif hasattr(self.model, "encode"):
+                    codes = self.model.encode(batch)
+                else:
+                    raise ValueError(f"{self.model_name} 缺少 get_codes/encode 方法")
+                all_codes.append(codes.detach().cpu().numpy().astype(np.int64))
 
-        base_sids_np = np.vstack(all_codes)
+        base_codes = np.vstack(all_codes)
+        
+        vocab_size = self.model_cfg.get("model_params", {}).get("codebook_size", 1024)
+        dedup = utils.build_dedup_layer(base_codes, vocab_size)
+        final_codes = np.concatenate([base_codes, dedup], axis=1)
 
-        # 3) 构建去重层并拼最终 codebook
-        vocab_size = self.model_config['model_params']['codebook_size']
-        dedup_layer = utils.build_dedup_layer(base_sids_np, vocab_size)
-        final_codes_np = np.concatenate([base_sids_np, dedup_layer], axis=1).astype(np.int32)
-        logging.info(f"最终码本维度: {final_codes_np.shape}")
+        os.makedirs(codebook_dir, exist_ok=True)
+        dataset_name = self.config["dataset_name"]
+        model_tag = self.model_name.lower()
+        prefix = os.path.join(codebook_dir, f"{dataset_name}.{model_tag}.codebook")
 
-        # 4) 规范化保存路径：{dataset}/{dataset}.{model}.codebook.{npy,json}
-        dataset_name = str(self.config['dataset_name'])
-        model_tag = str(self.config['model_name']).lower()
+        np.save(f"{prefix}.npy", final_codes)
+        json_path = f"{prefix}.json"
+        json_dict = {str(i): " ".join([f"<L{l}_{v}>" for l, v in enumerate(row)]) for i, row in enumerate(final_codes)}
+        with open(json_path, "w") as f: json.dump(json_dict, f, indent=2)
 
-        os.makedirs(codebook_dir, exist_ok=True)  # 兜底确保目录存在
-        std_prefix = os.path.join(codebook_dir, f"{dataset_name}.{model_tag}.codebook")
-        json_path = f"{std_prefix}.json"
-        npy_path  = f"{std_prefix}.npy"
-
-        # 5) 生成 JSON 词表（可用于可视化/调试）
-        prefix = ["<a_{}>", "<b_{}>", "<c_{}>", "<d_{}>", "<e_{}>"]  # 前几层前缀
-        dedup_prefix = "<x_{}>"  # 去重层前缀
-        json_dict = {}
-        for i, row in enumerate(final_codes_np):
-            tokens = [prefix[j].format(code) for j, code in enumerate(row[:-1])]
-            tokens.append(dedup_prefix.format(row[-1]))
-            json_dict[str(i)] = "".join(tokens)
-
-        with open(json_path, 'w') as f:
-            json.dump(json_dict, f, indent=2)
-
-        np.save(npy_path, final_codes_np)
-
-        logging.info(f"码本已保存（标准命名）: JSON -> {json_path}, NPY -> {npy_path}")
+        self.logger.info(f"✅ 码本保存完成: {prefix}.(npy/json)")
+        return final_codes

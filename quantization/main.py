@@ -18,14 +18,11 @@ from trainer import Trainer
 def main():
     parser = argparse.ArgumentParser(description="通用量化器训练脚本")
     
-    parser.add_argument('--model_name', type=str, required=True, choices=['rqvae','rkmeans'], help='要使用的量化器模型名称。')
+    parser.add_argument('--model_name', type=str, required=True, choices=['rqvae','vqvae', 'rkmeans','opq'], help='要使用的量化器模型名称。')
     parser.add_argument('--dataset_name', type=str, required=True, help='数据集名称 (e.g., Baby)')
-    parser.add_argument('--embedding_suffix', type=str, required=True, help='嵌入文件名后缀 (e.g., td)')
-    
-    # --- 核心改动 1：修改 config_path 参数 ---
-    # 将其变为可选，default=None
+    parser.add_argument('--embedding_modality', type=str, default='text', help='模态类型 (text / multi)')
+    parser.add_argument('--embedding_model', type=str, required=True, help='嵌入来源模型名称 (e.g., sentence-t5-base 或 text-embedding-3-large)')
     parser.add_argument('--config_path', type=str, default=None, help='配置文件路径。如果未提供，将根据模型名称自动查找。')
-    
     parser.add_argument('--data_base_path', type=str, default='../datasets', help='数据集根目录')
     parser.add_argument('--log_base_path', type=str, default='../logs/quantization', help='日志根目录')
     parser.add_argument('--ckpt_base_path', type=str, default='../ckpt/quantization', help='模型根目录')
@@ -66,6 +63,7 @@ def main():
         logging.error(f"特征文件未找到，程序终止。"); return
     item_embeddings = np.load(embedding_path)
     logging.info(f"特征加载完成, 维度: {item_embeddings.shape}")
+    config['total_item_count'] = len(item_embeddings)
     
     device = torch.device(config['common'].get('device', 'cuda:0'))
     logging.info(f"使用设备: {device}")

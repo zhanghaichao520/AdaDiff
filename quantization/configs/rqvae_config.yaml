@@ -1,6 +1,6 @@
-eval_interval: 50
 common:
   device: 'cuda:0' # 'cuda:0' or 'cpu'
+  eval_interval: 50
 
 # --- RQ-VAE 模型配置 ---
 rqvae:
