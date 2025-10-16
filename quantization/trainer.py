@@ -144,7 +144,8 @@ class Trainer:
         self.model.eval()
 
         dataset = EmbeddingDataset(embeddings_path)
-        loader = DataLoader(dataset, batch_size=self.train_cfg.get("batch_size", 1024))
+        # 增加 batch_size 以加速推論
+        loader = DataLoader(dataset, batch_size=self.train_cfg.get("batch_size", 2048) * 2)
         all_codes = []
 
         with torch.no_grad():
@@ -159,20 +160,33 @@ class Trainer:
                 all_codes.append(codes.detach().cpu().numpy().astype(np.int64))
 
         base_codes = np.vstack(all_codes)
-        
-        vocab_size = self.model_cfg.get("model_params", {}).get("codebook_size", 1024)
-        dedup = utils.build_dedup_layer(base_codes, vocab_size)
-        final_codes = np.concatenate([base_codes, dedup], axis=1)
+        self.logger.info(f"基礎碼本生成完畢，形狀: {base_codes.shape}")
+
+        # === ✅ 關鍵改動：根據 config 決定是否添加去重層 ===
+        model_params = self.model_cfg.get("model_params", {})
+        # 使用 .get('has_dup_layer', True) 確保如果 config 中沒有這個鍵，預設行為是添加去重層
+        if model_params.get('has_dup_layer', True):
+            self.logger.info("配置中 'has_dup_layer' 為 True 或未設置，將構建去重層。")
+            vocab_size = model_params.get("codebook_size", 1024)
+            dedup = utils.build_dedup_layer(base_codes, vocab_size)
+            final_codes = np.concatenate([base_codes, dedup], axis=1)
+        else:
+            self.logger.info("配置中 'has_dup_layer' 設置為 False，將不構建去重層。")
+            final_codes = base_codes
+        # =======================================================
 
         os.makedirs(codebook_dir, exist_ok=True)
         dataset_name = self.config["dataset_name"]
         model_tag = self.model_name.lower()
+        # 檔名格式: {dataset_name}.{model_name}.codebook
         prefix = os.path.join(codebook_dir, f"{dataset_name}.{model_tag}.codebook")
 
         np.save(f"{prefix}.npy", final_codes)
+        
+        # 保存 JSON 格式 (可選)
         json_path = f"{prefix}.json"
         json_dict = {str(i): " ".join([f"<L{l}_{v}>" for l, v in enumerate(row)]) for i, row in enumerate(final_codes)}
         with open(json_path, "w") as f: json.dump(json_dict, f, indent=2)
 
-        self.logger.info(f"✅ 码本保存完成: {prefix}.(npy/json)")
+        self.logger.info(f"✅ 码本保存完成，最終形狀: {final_codes.shape}，已保存至: {prefix}.(npy/json)")
         return final_codes

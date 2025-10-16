@@ -9,7 +9,7 @@ python amazon_text_emb.py \
 # API模型embedding
 python amazon_text_emb.py \
   --mode api \
-  --dataset Beauty \
+  --dataset Toys_and_Games \
   --sent_emb_model text-embedding-3-large \
   --openai_api_key sk-WR6aJpZ81gACet0aN8wXYx0lUfC0WgjjcrFRZAJKatkeuTke \
   --openai_base_url https://yunwu.ai/v1 \

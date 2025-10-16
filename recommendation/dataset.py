@@ -17,36 +17,32 @@ def pad_or_truncate(sequence, max_len, PAD_TOKEN=0):
 
 def item2code(code_path, vocab_sizes, bases):
     """
-    将 codebook 的每一行 [c0, c1, c2, dup] 编码为 4 个 token：
-      token_i = raw_i + bases[i] + 1
-    其中 0 留给 PAD。
+    【已自適應】將 codebook 的每一行 [c0, c1, ..., dup] 编码為 N 個 token。
     """
     data = np.load(code_path, allow_pickle=True)
     mat = np.vstack(data) if data.dtype == object else data
-    assert mat.shape[1] == 4, f"Expect 4 columns in codebook, got {mat.shape[1]}"
-
-    K0, K1, K2, K3 = map(int, vocab_sizes)
-    B0, B1, B2, B3 = map(int, bases)
+    
+    num_levels = len(vocab_sizes) # ✅ 從傳入的參數動態獲取總長度
+    assert mat.shape[1] == num_levels, f"Expect {num_levels} columns in codebook, got {mat.shape[1]}"
 
     item_to_code = {}
     code_to_item = {}
 
-    for index, row in enumerate(mat):  # 假定 item_id = index + 1
-        c0, c1, c2, dup = map(int, row.tolist())
+    for index, row in enumerate(mat):
+        # ✅ 關鍵改動：使用迴圈處理任意長度的 code
+        code_values = [int(c) for c in row]
+        
+        # 範圍校驗
+        for i, code_val in enumerate(code_values):
+            if not (0 <= code_val < vocab_sizes[i]):
+                raise ValueError(f"Out-of-range code {code_val} at index {i} for row {row} with vocab_sizes={vocab_sizes}")
 
-        # 范围校验
-        if not (0 <= c0 < K0 and 0 <= c1 < K1 and 0 <= c2 < K2 and 0 <= dup < K3):
-            raise ValueError(f"Out-of-range codes {row} with vocab_sizes={vocab_sizes}")
-
-        t0 = c0 + B0 + 1
-        t1 = c1 + B1 + 1
-        t2 = c2 + B2 + 1
-        t3 = dup + B3 + 1
-
-        offsets = [t0, t1, t2, t3]
+        # Token 偏移計算
+        tokens = [code_val + bases[i] + 1 for i, code_val in enumerate(code_values)]
+        
         item_id = index + 1
-        item_to_code[item_id] = offsets
-        code_to_item[tuple(offsets)] = item_id
+        item_to_code[item_id] = tokens
+        code_to_item[tuple(tokens)] = item_id
 
     return item_to_code, code_to_item
 
@@ -172,8 +168,9 @@ class GenRecDataset(Dataset):
 
 
             self.data.append({
-                'history': hist_codes,   # [[l1,l2,...], [l1,l2,...], ...]
-                'target': tgt_code       # [t1,t2,...]
+                'history': hist_codes,
+                'target_code': tgt_code, # 將原來的 'target' 重新命名
+                'target_id': tgt_id      # 新增原始的 item id
             })
 
     def __getitem__(self, index):

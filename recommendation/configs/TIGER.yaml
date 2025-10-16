@@ -1,50 +1,19 @@
-# configs/TIGER.yaml
-# TIGER 模型的通用配置文件
+# 檔案路徑: configs/TIGER.yaml
 
-# ----------------- 路径配置 -----------------
-# ----------------- 路径模板 -----------------
-# 使用 {dataset_name} 和 {quant_method}作为占位符
-# Python 代码会自动填充这些值
-paths:
-  dataset_root: "../datasets/{dataset_name}"
-  output_root: "./output/TIGER/{dataset_name}_{quant_method}"
-  
-  # codebook 命名约定: {dataset_name}.{quant_method}.codebook.npy
-  codebook_template: "{dataset_root}/codebooks/{dataset_name}.{quant_method}.codebook.npy"
-  
-  # RQ-VAE 配置文件路径 (如果使用 rqvae)
-  rqvae_config_path: "../quantization/configs/rqvae_config.yaml"
-
-
-# ----------------- 模型参数 -----------------
+# TIGER 模型獨有的架構參數
 model_params:
-  num_layers: 4
-  num_decoder_layers: 4
-  d_model: 128
-  d_ff: 1024
-  num_heads: 6
-  d_kv: 64
-  dropout_rate: 0.1
-  feed_forward_proj: 'relu'
   max_len: 20
+  d_model: 512
+  d_ff: 2048
+  d_kv: 64
+  num_layers: 6
+  num_decoder_layers: 6
+  num_heads: 8
+  dropout_rate: 0.1
 
-# ----------------- 训练参数 -----------------
+# ✨ 範例：覆蓋 base.yaml 中的通用參數
+# 假設 TIGER 模型使用較小的學習率效果更好
 training_params:
-  num_epochs: 200
+  lr: 0.0005 
   batch_size: 1024
-  infer_size: 96
-  lr: 0.0001
-  device: 'cuda'
-  seed: 2025
-  early_stop: 10
-
-# ----------------- 评估参数 -----------------
-evaluation_params:
-  topk_list: [5, 10, 20]
-  beam_size: 30
-
-# ----------------- 量化默认值 -----------------
-# 当 quant_method 不是 'rqvae' 时使用这些值来推导词表
-quantization_defaults:
-  codebook_size: 256
-  num_levels: 3
+  # 注意：我們沒有寫 batch_size，它會自動從 base.yaml 繼承

@@ -22,6 +22,12 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 
 # ⚙️ Capability Matrix
 
+## Dataset
+
+| Dataset | Implemented |
+|--------------------|--------------|
+| Amazon | ✅ |
+
 ## 💬 Embedding Extraction
 | Category | Component / Method | Implemented |
 |-----------|--------------------|--------------|
@@ -40,6 +46,7 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 |  | R-KMeans | ✅ |
 |  | VQ-VAE   | ✅ |
 | 🔹 Product Family | OPQ | ✅ |
+|  | PQ   | ✅ |
 
 ## ⚙️ Recommendation Architecture
 | Category | Component / Method | Implemented |

@@ -11,6 +11,7 @@ vqvae:
     hidden_sizes: [512, 256]   # 編碼器/解碼器 MLP 的隱藏層維度
     latent_size: 128           # 隱空間的維度 (等於碼本中每個向量的維度)
     codebook_size: 2048       # 碼本的大小 (K)
+    num_levels: 1
     dropout: 0.1
     commitment_cost: 0.25    # VQ-VAE 的關鍵超參，用於調節 commitment loss 的權重
 
