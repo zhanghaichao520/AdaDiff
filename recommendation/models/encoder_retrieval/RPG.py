@@ -75,84 +75,75 @@ class RPG(AbstractModel):
         return torch.from_numpy(full_codes).long()
 
     def forward(self, batch: Dict) -> Dict:
-        """
-        【完整修正版】
-        此版本整合了所有必要的修正，以正確處理 DataLoader 提供的「壓扁」
-        token 序列，並將其轉換為 GPT-2 模型期望的輸入格式。
-        """
-        # --- 1. 從 batch 中獲取基礎數據 ---
+        # --- (前面 1, 2, 3, 4 步驟的數據準備和 GPT-2 forward 不變) ---
         input_tokens = batch['input_ids']
         target_tokens = batch['labels']
         batch_size = input_tokens.shape[0]
-
-        # ✅ 修正 1：動態地從輸入張量中獲取當前的設備 (CPU/GPU)
-        # 這樣就無需依賴不存在的 self.device
         current_device = input_tokens.device
-
-        # --- 2. 重組輸入：將 token 序列轉換為 item embedding 序列 ---
-        # (B, L_flat) -> (B, L_flat, D)
         token_embs = self.gpt2.wte(input_tokens)
-        
-        # (B, L_flat, D) -> (B, num_items, code_len, D)
-        # 使用 -1 讓 PyTorch 自動計算序列中的 item 數量
-        item_code_embs = token_embs.view(
-            batch_size, -1, self.config['code_len'], self.config['model_params']['n_embd']
-        )
-        
-        # (B, num_items, code_len, D) -> (B, num_items, D)
-        # 對每個 item 的 code embeddings 求平均，得到 GPT-2 期望的輸入
+        item_code_embs = token_embs.view(batch_size, -1, self.config['code_len'], self.config['model_params']['n_embd'])
         input_embs = item_code_embs.mean(dim=2)
-
-        # --- 3. 重建 Attention Mask：將 token-level mask 轉換為 item-level mask ---
         token_level_attention_mask = batch['attention_mask']
-        
-        # (B, L_flat) -> (B, num_items, code_len)
-        reshaped_mask = token_level_attention_mask.view(
-            batch_size, input_embs.shape[1], self.config['code_len']
-        )
-        
-        # (B, num_items, code_len) -> (B, num_items)
-        # 只要一個 item 的 codes 中有任何一個 token 不是 padding，該 item 就不是 padding
+        reshaped_mask = token_level_attention_mask.view(batch_size, input_embs.shape[1], self.config['code_len'])
         item_level_attention_mask = reshaped_mask.any(dim=2).long()
-
-        # --- 4. 執行 GPT-2 的前向傳播 ---
         outputs = self.gpt2(inputs_embeds=input_embs, attention_mask=item_level_attention_mask)
-        
-        # --- 5. 計算 Loss ---
-        # 根據 item-level 的 mask 計算真實序列長度
         seq_lens = item_level_attention_mask.sum(dim=1)
-        # 提取每個序列的最後一個有效時間步的 hidden state
         last_hidden_states = outputs.last_hidden_state[torch.arange(batch_size, device=current_device), seq_lens - 1]
-        
-        # 通過預測頭
         final_states = [head(last_hidden_states) for head in self.pred_heads]
-        final_states = torch.stack(final_states, dim=1) # (B, L_code, D)
+        final_states = torch.stack(final_states, dim=1)
         final_states = F.normalize(final_states, dim=-1)
 
-        # 準備詞表 embedding
+        # --- 5. 計算 Loss (採用 Chunk 方式) ---
         token_emb = self.gpt2.wte.weight
         token_emb = F.normalize(token_emb, dim=-1)
         
-        # ✅ 使用我們獲取的 current_device 來創建新的張量
-        bases = torch.tensor(self.config['bases'], device=current_device)
-        vocab_sizes = torch.tensor(self.config['vocab_sizes'], device=current_device)
+        # ✅ 關鍵修正：模仿原始 RPG 的 chunk 邏輯
+        bases = self.config['bases']
+        vocab_sizes = self.config['vocab_sizes']
         
-        # 分層計算 loss
+        # 檢查是否所有 vocab_sizes 都相同 (RPG/OPQ/PQ 應該是這種情況)
+        all_same_size = all(vs == vocab_sizes[0] for vs in vocab_sizes)
+        
+        if all_same_size and len(vocab_sizes) == self.n_pred_head:
+            # 如果大小都相同，我們可以安全地使用 chunk
+            codebook_size_k = vocab_sizes[0]
+            # 假設有效的 token 從 index 1 開始，到 bases[-1] + vocab_sizes[-1] 結束
+            start_idx = 1
+            # 注意：這裡假設 token ID 是連續的
+            end_idx = start_idx + self.n_pred_head * codebook_size_k 
+            usable_token_embs = token_emb[start_idx:end_idx]
+            
+            # 檢查切片後的維度是否能被 chunk 整除
+            if usable_token_embs.shape[0] == self.n_pred_head * codebook_size_k:
+                token_embs_chunks = torch.chunk(usable_token_embs, self.n_pred_head, dim=0)
+            else:
+                # 如果因為某些原因（例如 vocab_size 計算包含了 EOS 等）導致不能整除，
+                # 我們回退到原來的動態切片方法，並打印警告
+                print("Warning: Cannot use torch.chunk due to shape mismatch. Falling back to dynamic slicing.")
+                all_same_size = False # 標記為 False，強制使用下面的 else 分支
+        
         losses = []
         for i in range(self.n_pred_head):
-            # 獲取第 i 層的詞表 embedding
-            start_idx = bases[i] + 1
-            end_idx = start_idx + vocab_sizes[i]
-            token_embs_i = token_emb[start_idx:end_idx]
-            
-            # 計算 logits
+            if all_same_size:
+                # 使用 chunk 獲取的 embedding
+                token_embs_i = token_embs_chunks[i]
+            else:
+                # 使用原來的動態切片方法
+                start_idx = bases[i] + 1
+                end_idx = start_idx + vocab_sizes[i]
+                token_embs_i = token_emb[start_idx:end_idx]
+
+            # 計算 logits (這部分不變)
             logits_i = torch.matmul(final_states[:, i, :], token_embs_i.T) / self.temperature
             
-            # 獲取第 i 層的 label，並將其還原為 0-based
+            # 獲取第 i 層的 label (這部分也不變，它本身是正確的)
+            # labels_i 的值域是 [0, vocab_sizes[i]-1]
             labels_i = target_tokens[:, i] - bases[i] - 1
+            
+            # 增加一個斷言，確保 labels_i 的值在有效範圍內
+            assert torch.all(labels_i >= 0) and torch.all(labels_i < vocab_sizes[i]), \
+                   f"Label index out of range for head {i}! Min: {labels_i.min()}, Max: {labels_i.max()}, Vocab Size: {vocab_sizes[i]}"
 
-            
-            
             losses.append(self.loss_fct(logits_i, labels_i))
             
         loss = torch.mean(torch.stack(losses))

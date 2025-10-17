@@ -17,7 +17,7 @@ model_params:
 evaluation_params:
   topk_list: [5, 10, 20]
   beam_size: 20
-  batch_size: 1024
+  batch_size: 256
 
 # 所有模型共享的路徑模板
 paths:

@@ -1,0 +1,5 @@
+model_params:
+  n_layer: 6              # 迷你版 GPT-2
+  n_head: 8
+  n_embd: 512
+  # dropout 可按需添加：attn_pdrop, embd_pdrop, resid_pdrop 等

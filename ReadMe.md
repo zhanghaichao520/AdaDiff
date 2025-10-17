@@ -45,6 +45,7 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 | 🔸 Residual Family | RQ-VAE | ✅ |
 |  | R-KMeans | ✅ |
 |  | VQ-VAE   | ✅ |
+|  | R-VQ     |   |
 | 🔹 Product Family | OPQ | ✅ |
 |  | PQ   | ✅ |
 
@@ -52,10 +53,10 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 | Category | Component / Method | Implemented |
 |-----------|--------------------|--------------|
 | 🧠 Encoder–Decoder | T5-style Seq2Seq | ✅ |
-| 💬 Decoder-Only | GPT-style Autoregressive | ✅ |
+| 💬 Decoder-Only | GPT-style Autoregressive | - |
 | 🔍 Encoder + Retrieval | Retrieval-Augmented Encoder | ✅ |
 | 🔧 Plugins | Beam Search | ✅ |
-|  | Prefix Tree Constraint | ✅ |
+|  | Prefix Tree Constraint | - |
 
 
 
