@@ -110,25 +110,62 @@ def process_jsonl(file_path, max_len, PAD_TOKEN=0):
 # -----------------------------
 class GenRecDataset(Dataset):
     """
-    【極簡版】
-    此版本只負責載入原始 Item ID 序列數據，完全與 Code Token 解耦。
+    【最終推薦版 - 兼容 TIGER & RPG】
+    此版本在初始化時根據 config 加載原始數據和 item2code 映射，
+    並在 __getitem__ 中返回所有下游 collate_fn 可能需要的數據格式。
     """
     def __init__(self, config: dict, mode: str):
         self.config = config
         self.mode = mode
-        self.dataset_path = self.config[f'{mode}_json'] # 假設只用 jsonl
+        self.dataset_path = self.config[f'{mode}_json']
         self.max_len = self.config['model_params']['max_len']
-        # ✅ 不再需要 code_path, vocab_sizes, bases
+        # ✅ 需要 PAD_TOKEN ID
+        self.PAD_TOKEN_ID = self.config['token_params']['pad_token_id'] 
         
-        # ✅ 直接載入原始數據 (返回 {'history': [0-based ids], 'target': 0-based id})
-        self.data = process_jsonl(self.dataset_path, self.max_len, PAD_TOKEN=0) # Item ID 用 0 做 padding
+        # ✅ 關鍵改動：在 __init__ 中載入 item2code 映射
+        self.vocab_sizes = self.config['vocab_sizes']
+        self.bases = self.config['bases']
+        self.num_levels = len(self.vocab_sizes)
+        self.item_to_code, _ = item2code(
+            self.config['code_path'], self.vocab_sizes, self.bases
+        )
+        
+        # 載入原始數據 (Item IDs)
+        # 注意: process_jsonl 返回的是 {'history': [padded_0based_ids], 'target': 0based_id}
+        self.raw_data = process_jsonl(self.dataset_path, self.max_len, PAD_TOKEN=0) # Item ID 用 0 做 padding
 
     def __len__(self):
-        return len(self.data)
+        return len(self.raw_data)
 
     def __getitem__(self, index):
-        # ✅ 直接返回最原始的數據
-        return self.data[index]
+        # 獲取原始數據 (已經 padding 過的 0-based ID 序列)
+        item = self.raw_data[index]
+        hist_ids_0based_padded = item['history']
+        tgt_id_0based = item['target']
+
+        # --- 動態準備 Code Tokens ---
+        code_pad_token_list = [self.PAD_TOKEN_ID] * self.num_levels
+        # ✅ 使用 padding 過的 history ID 進行查找，遇到 0 (padding ID) 時返回 padding code
+        hist_codes = [self.item_to_code.get(x + 1, code_pad_token_list) if x != 0 else code_pad_token_list 
+                      for x in hist_ids_0based_padded]
+        tgt_code = self.item_to_code.get(tgt_id_0based + 1, code_pad_token_list)
+        
+        # --- 準備 1-based Item IDs (去除 padding) ---
+        hist_ids_1based = [x + 1 for x in hist_ids_0based_padded if x != 0]
+
+        # ✅ 返回所有可能需要的數據
+        return {
+            # 原始 0-based ID 序列 (含 padding)，用於可能的未來模型
+            'history_raw_padded': hist_ids_0based_padded, 
+            # 1-based 原始 ID 序列 (不含 padding)，用於 RPG collate
+            'hist_ids': hist_ids_1based,    
+            # Code Token 序列 (含 padding code)，用於 TIGER collate
+            'history': hist_codes,          
+            # Target Code Token
+            'target_code': tgt_code,        
+            # 0-based Target 原始 ID
+            'target_id': tgt_id_0based      
+        }
 
 
 # --------------- 简单自测 ---------------

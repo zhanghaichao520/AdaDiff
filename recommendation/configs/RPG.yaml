@@ -19,6 +19,7 @@ model_params:
 training_params:
   batch_size: 256
   lr: 0.01
+  early_stop: 20
 
 evaluation_params:
   batch_size: 512 # 評估時的 batch size
