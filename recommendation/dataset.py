@@ -109,75 +109,26 @@ def process_jsonl(file_path, max_len, PAD_TOKEN=0):
 # 统一 Dataset
 # -----------------------------
 class GenRecDataset(Dataset):
-    def __init__(self, dataset_path, code_path, mode, max_len, PAD_TOKEN=0,
-                 vocab_sizes=None, bases=None, input_format=None):
-        self.dataset_path = dataset_path
-        self.code_path = code_path
+    """
+    【極簡版】
+    此版本只負責載入原始 Item ID 序列數據，完全與 Code Token 解耦。
+    """
+    def __init__(self, config: dict, mode: str):
+        self.config = config
         self.mode = mode
-        self.max_len = max_len
-        self.PAD_TOKEN = PAD_TOKEN
-
-        assert vocab_sizes is not None and bases is not None, \
-            "Must pass vocab_sizes and bases from main.py"
-        self.vocab_sizes = vocab_sizes
-        self.bases = bases
-        self.num_levels = len(self.vocab_sizes)  # ✅ 补上
-
-
-        # 加载 codebook 映射（按位偏移编码）
-        self.item_to_code, self.code_to_item = item2code(
-            code_path, vocab_sizes=self.vocab_sizes, bases=self.bases
-        )
-
-        # 自动判断/显式指定输入格式
-        if input_format is None:
-            ext = os.path.splitext(dataset_path)[1].lower()
-            if ext == ".jsonl":
-                input_format = "jsonl"
-            elif ext == ".parquet":
-                input_format = "parquet"
-            else:
-                raise ValueError(f"Unknown file extension for dataset_path: {dataset_path}")
-
-        self.input_format = input_format
-
-        # 预处理
-        if self.input_format == "jsonl":
-            # JSONL 不需要 mode；不滑窗
-            processed = process_jsonl(
-                self.dataset_path, self.max_len, self.PAD_TOKEN
-            )
-        elif self.input_format == "parquet":
-            processed = process_parquet(
-                self.dataset_path, self.mode, self.max_len, self.PAD_TOKEN
-            )
-        else:
-            raise ValueError("input_format must be 'jsonl' or 'parquet'.")
-
-        # itemID -> code 映射
-        self.data = []
-        for item in processed:
-            hist_ids = item['history']
-            tgt_id = item['target']
-
-            # 把每个 itemID 映射成 num_levels 长度的 code 列表
-            hist_codes = [
-                self.item_to_code.get(int(x) + 1, [self.PAD_TOKEN]*self.num_levels) for x in hist_ids
-            ]
-            tgt_code = self.item_to_code.get(int(tgt_id) + 1, [self.PAD_TOKEN]*self.num_levels)
-
-
-            self.data.append({
-                'history': hist_codes,
-                'target_code': tgt_code, # 將原來的 'target' 重新命名
-                'target_id': tgt_id      # 新增原始的 item id
-            })
-
-    def __getitem__(self, index):
-        return self.data[index]
+        self.dataset_path = self.config[f'{mode}_json'] # 假設只用 jsonl
+        self.max_len = self.config['model_params']['max_len']
+        # ✅ 不再需要 code_path, vocab_sizes, bases
+        
+        # ✅ 直接載入原始數據 (返回 {'history': [0-based ids], 'target': 0-based id})
+        self.data = process_jsonl(self.dataset_path, self.max_len, PAD_TOKEN=0) # Item ID 用 0 做 padding
 
     def __len__(self):
         return len(self.data)
+
+    def __getitem__(self, index):
+        # ✅ 直接返回最原始的數據
+        return self.data[index]
 
 
 # --------------- 简单自测 ---------------

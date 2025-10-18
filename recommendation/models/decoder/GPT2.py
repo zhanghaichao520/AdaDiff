@@ -1,61 +1,57 @@
-# models/tiger_gpt2.py
-from typing import Any, Dict, List
 import torch
+import torch.nn as nn
+from typing import Any, Dict, List
 import transformers
-from ..abstract_model import AbstractModel
 
+from ..abstract_model import AbstractModel
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# 確保 metrics 模組可以被正確導入
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from metrics import recall_at_k, ndcg_at_k
 
-GPT2LMHeadModel = transformers.GPT2LMHeadModel
+# 從 transformers 導入 GPT-2 相關的配置和模型
 GPT2Config = transformers.GPT2Config
-
+GPT2LMHeadModel = transformers.GPT2LMHeadModel
 
 class GPT2(AbstractModel):
     """
-    Decoder-only 版本的 TIGER，基于 GPT-2（无预训练权重）。
-    约定：
-      - batch 包含 input_ids / attention_mask / labels
-      - code_len 从 config['code_len'] 读取
-      - 评估使用与 T5 版一致的 beam search 和 pos_index 逻辑
+    一個仿照 TIGER 介面的 Decoder-Only 生成式模型。
+    它使用 GPT-2 架構從零開始訓練，專用於序列推薦任務。
     """
-
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
+        
+        model_params = config['model_params']
+        token_params = config['token_params']
 
-        model_params = config["model_params"]          # GPT-2 结构超参（n_layer/n_head/n_embd等）
-        token_params = config["token_params"]          # 词表、特殊符号等
-        vocab_size = token_params["vocab_size"]
-        bos_token_id = token_params.get("bos_token_id", 1)
-        eos_token_id = token_params.get("eos_token_id", 2)
-        pad_token_id = token_params.get("pad_token_id", 0)
-
-        # ⚠️ GPT-2 默认没有 pad/bos/eos，这里显式配置
-        gpt2cfg = GPT2Config(
-            **model_params,
-            vocab_size=vocab_size,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            n_positions=token_params.get("n_positions", 1024),
-            n_ctx=token_params.get("n_positions", 1024),
+        # 1. 創建 GPT-2 的設定
+        gpt2config = GPT2Config(
+            vocab_size=token_params['vocab_size'],
+            # 總長度 = 歷史最大長度 + 目標 code 長度
+            n_positions=model_params['max_len'] * config['code_len'] + config['code_len'],
+            n_embd=model_params['n_embd'],
+            n_layer=model_params['n_layer'],
+            n_head=model_params['n_head'],
+            n_inner=model_params.get('n_inner', model_params.get('d_ff', 2048)), # 兼容 d_ff
+            activation_function=model_params.get('activation_function', 'gelu_new'),
+            resid_pdrop=model_params.get('resid_pdrop', 0.1),
+            embd_pdrop=model_params.get('embd_pdrop', 0.1),
+            attn_pdrop=model_params.get('attn_pdrop', 0.1),
+            layer_norm_epsilon=float(model_params.get('layer_norm_epsilon', 1e-5)),
+            initializer_range=model_params.get('initializer_range', 0.02),
+            # 指定特殊 token，生成時會用到
+            eos_token_id=token_params['eos_token_id'],
+            pad_token_id=token_params['pad_token_id'],
         )
-        self.gpt2 = GPT2LMHeadModel(config=gpt2cfg)
 
-        # 确保词表大小
-        self.gpt2.resize_token_embeddings(vocab_size)
-
-        # 保存一个字符串版参数统计
+        # 2. 實例化 GPT2LMHeadModel (for Language Modeling)
+        self.gpt2 = GPT2LMHeadModel(config=gpt2config)
         self.n_params_str = self._calculate_n_parameters()
-
-        # 保存 pad/eos 以便 generate 使用
-        self._pad_id = pad_token_id
-        self._eos_id = eos_token_id
 
     @property
     def task_type(self) -> str:
-        return "generative"
+        return 'generative'
 
     @property
     def n_parameters(self) -> str:
@@ -66,108 +62,123 @@ class GPT2(AbstractModel):
         total_params = num_params(self.parameters())
         emb_params = num_params(self.gpt2.get_input_embeddings().parameters())
         return (
-            f"# Embedding parameters: {emb_params:,}\n"
-            f"# Non-embedding parameters: {total_params - emb_params:,}\n"
-            f"# Total trainable parameters: {total_params:,}\n"
+            f'# Embedding parameters: {emb_params:,}\n'
+            f'# Non-embedding parameters: {total_params - emb_params:,}\n'
+            f'# Total trainable parameters: {total_params:,}\n'
         )
-
-    # --- 训练/前向 ---
+    
     def forward(self, batch: Dict) -> Dict:
         """
-        通用 forward：
-        - 若 labels 长度 < input_ids，自动扩展并在历史段 mask 掉 (-100)
-        - 兼容 decoder-only GPT2
+        為 Decoder-Only 模型準備輸入。
+        核心思想：將 history 和 labels 拼接成一個長序列進行自回歸訓練。
         """
-        known = {"input_ids", "attention_mask", "labels"}
-        inputs = {k: v for k, v in batch.items() if k in known}
+        history_ids = batch['input_ids']      # (B, L_hist_flat)
+        target_ids = batch['labels']        # (B, L_target)
+        history_mask = batch['attention_mask'] # (B, L_hist_flat)
+        
+        # 1. 拼接輸入序列: [history_tokens, target_tokens]
+        combined_ids = torch.cat([history_ids, target_ids], dim=1)
+        
+        # 2. 創建拼接後的 attention mask
+        target_mask = torch.ones_like(target_ids)
+        combined_mask = torch.cat([history_mask, target_mask], dim=1)
 
-        # 🔍 自动检测是否为 GPT-2 decoder-only 模型
-        if isinstance(self.gpt2, transformers.GPT2LMHeadModel):
-            input_ids = inputs["input_ids"]
-            labels = inputs.get("labels")
+        # 3. 創建用於計算 loss 的 labels
+        # 我們只計算 target 部分的 loss，所以 history 部分的 label 設為 -100
+        history_labels = torch.full_like(history_ids, -100)
+        combined_labels = torch.cat([history_labels, target_ids], dim=1)
 
-            if labels is not None:
-                # case: labels shape 不匹配 input_ids
-                if labels.shape[1] < input_ids.shape[1]:
-                    B, seq_len = input_ids.shape
-                    new_labels = torch.full_like(input_ids, -100)
+        # 4. 傳給 GPT-2 模型
+        outputs = self.gpt2(
+            input_ids=combined_ids,
+            attention_mask=combined_mask,
+            labels=combined_labels
+        )
+        return outputs
 
-                    # 把目标 code_len 段贴在序列末尾
-                    code_len = labels.shape[1]
-                    new_labels[:, -code_len:] = labels
-                    inputs["labels"] = new_labels
-
-        # ✅ 正常前向
-        return self.gpt2(**inputs)
-
-
-    # --- 生成 ---
     def generate(self, **kwargs: Any) -> torch.Tensor:
-        """
-        调用 GPT-2 的标准 generate。需要注意：
-          - decoder-only 不需要 encoder 输入
-          - 需提供 pad_token_id/eos_token_id
-        """
-        kwargs.setdefault("eos_token_id", self._eos_id)
-        kwargs.setdefault("pad_token_id", self._pad_id)
+        """執行 GPT-2 的標準生成。"""
+        # generate 只需要 history (input_ids) 作為 prompt
         return self.gpt2.generate(**kwargs)
 
-    # --- 评估（与 T5 版保持一致的度量口径） ---
     def evaluate_step(self, batch: Dict[str, torch.Tensor], topk_list: List[int]) -> Dict[str, float]:
-        beam_size = self.config["evaluation_params"]["beam_size"]
-        code_len = self.config["code_len"]
+        """
+        評估邏輯與 TIGER 非常相似，但需要處理 GPT-2 generate 的輸出格式。
+        """
+        beam_size = self.config['evaluation_params']['beam_size']
+        code_len = self.config['code_len']
 
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
+        # 準備 generation 的輸入，只需要 history
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        labels = batch['labels']
         device = input_ids.device
 
-        # 1) 生成多样本（beam）
+        # 1. 生成
         preds = self.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             num_beams=beam_size,
             num_return_sequences=beam_size,
             max_new_tokens=code_len,
-            do_sample=False,
             early_stopping=False,
-            eos_token_id=self._eos_id,
-            pad_token_id=self._pad_id,
+            pad_token_id=self.config['token_params']['pad_token_id'],
+            eos_token_id=self.config['token_params']['eos_token_id']
         )
-        # 2) 对齐形状：取新生成的 code_len 段（这里假设 input 已经包含 BOS 或历史）
-        #    GPT-2 generate 的输出是 [prompt + new_tokens]，取末尾 code_len 个 token
-        preds = preds[:, -code_len:].contiguous().view(input_ids.shape[0], beam_size, -1)
-
-        # 3) 命中计算（与 T5 版一致：前 L-1 全相等，最后一位 >= 真值）
-        pos_index = self._calculate_pos_index(preds, labels, maxk=beam_size).to(device)
-
-        # 4) 指标
-        out = {}
+        
+        # 2. 後處理
+        # GPT-2 的輸出包含了輸入的 prompt (history_ids)，我們需要把它切掉
+        # preds shape: (B * beam_size, L_hist_flat + L_target)
+        generated_part = preds[:, input_ids.shape[1]:]
+        # Reshape to (B, beam_size, L_target)
+        preds_reshaped = generated_part.view(input_ids.shape[0], beam_size, -1)
+        
+        # 3. 計算命中 (與 TIGER 完全相同的邏輯)
+        pos_index = self._calculate_pos_index(preds_reshaped, labels, maxk=beam_size)
+        pos_index = pos_index.to(device)
+        
+        # 4. 計算指標
+        batch_metrics = {}
         for k in topk_list:
-            out[f"Recall@{k}"] = recall_at_k(pos_index, k).mean().item()
-            out[f"NDCG@{k}"]   = ndcg_at_k(pos_index, k).mean().item()
-        return out
-
+            recall = recall_at_k(pos_index, k).mean().item()
+            ndcg = ndcg_at_k(pos_index, k).mean().item()
+            batch_metrics[f'Recall@{k}'] = recall
+            batch_metrics[f'NDCG@{k}'] = ndcg
+          
+        return batch_metrics
+  
     @staticmethod
     def _calculate_pos_index(preds: torch.Tensor, labels: torch.Tensor, maxk: int) -> torch.Tensor:
         """
-        preds: (B, maxk, L)
-        labels: (B, L)
-        命中：前 L-1 完全一致 && 最后一位 (dup) 预测 >= 真实
+        【與 TIGER 共享的評估邏輯】
+        假設 code 總是包含 L-1 個語義層和最後 1 個重複層。
         """
         preds = preds.detach().cpu()
         labels = labels.detach().cpu()
-        B, _, L = preds.shape
-        assert L == labels.shape[1], f"Code length mismatch: preds {L} vs labels {labels.shape[1]}"
+        B, _, L_pred = preds.shape
+        L_label = labels.shape[1]
 
+        # 如果生成長度不足（例如提前遇到 EOS），用 padding 補齊
+        if L_pred < L_label:
+            padding = torch.zeros((B, maxk, L_label - L_pred), dtype=preds.dtype)
+            preds = torch.cat([preds, padding], dim=2)
+        # 如果生成長度過長，截斷
+        elif L_pred > L_label:
+            preds = preds[:, :, :L_label]
+        
         pos_index = torch.zeros((B, maxk), dtype=torch.bool)
         for i in range(B):
             gt = labels[i]
-            gt_sem, gt_dup = gt[:-1].tolist(), int(gt[-1].item())
+            gt_semantic = gt[:-1].tolist()
+            gt_dup  = int(gt[-1].item())
+
             for j in range(maxk):
                 pj = preds[i, j]
-                pj_sem, pj_dup = pj[:-1].tolist(), int(pj[-1].item())
-                if pj_sem == gt_sem and pj_dup >= gt_dup:
+                pj_semantic = pj[:-1].tolist()
+                pj_dup  = int(pj[-1].item())
+
+                if pj_semantic == gt_semantic and pj_dup >= gt_dup:
                     pos_index[i, j] = True
                     break
         return pos_index
+

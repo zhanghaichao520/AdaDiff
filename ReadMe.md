@@ -29,7 +29,7 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 | Amazon | ✅ |
 
 ## 💬 Embedding Extraction
-| Category | Component / Method | Implemented |
+| Category | Component / Method | Done |
 |-----------|--------------------|--------------|
 | 🧠 Textual | Sentence Embedding | ✅ |
 |  | OpenAI Embedding API | ✅ |
@@ -40,23 +40,25 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 | 🧩 Management | PCA Compression & Storage | ✅ |
 
 ## 🧩 Quantization
-| Category | Component / Method | Implemented |
+| Category | Component / Method | Done |
 |-----------|--------------------|--------------|
 | 🔸 Residual Family | RQ-VAE | ✅ |
 |  | R-KMeans | ✅ |
 |  | VQ-VAE   | ✅ |
-|  | R-VQ     |   |
+|  | R-VQ     | ✅ |
 | 🔹 Product Family | OPQ | ✅ |
 |  | PQ   | ✅ |
 
 ## ⚙️ Recommendation Architecture
-| Category | Component / Method | Implemented |
+| Category | Component / Method | Done |
 |-----------|--------------------|--------------|
-| 🧠 Encoder–Decoder | T5-style Seq2Seq | ✅ |
-| 💬 Decoder-Only | GPT-style Autoregressive | - |
-| 🔍 Encoder + Retrieval | Retrieval-Augmented Encoder | ✅ |
-| 🔧 Plugins | Beam Search | ✅ |
+| 🧠 Encoder–Decoder | TIGER | ✅ |
+| 💬 Decoder-Only | GPT2 | ✅ |
+|                 | LLM(Qwen, LLaMA) | ✅ |
+| 🔍 Encoder-Retrieval | RPG | ✅ |
+| 🔧 Plugins | Beam Search | - |
 |  | Prefix Tree Constraint | - |
+
 
 
 
@@ -68,14 +70,11 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 
 ## 📦 Supported Models
 
-| **Category** | **Model** | **Paper** | **Conference/Journal** | **Code** |
-|---------------|------------|-----------|------------------------|-----------|
-| **Tokenization & Quantization** | TIGER | [Residual Quantized Variational Autoencoder for Discrete Representation](https://arxiv.org/abs/2305.14422) | CVPR’23 | rqvae.py |
-
-
----
-
-# Usage
+| **Category** | **Model** | **Paper** | **Conference/Journal** | **Code** | **Done** |
+|---------------|------------|-----------|------------------------|-----------|-----------|
+| **Encoder-Decoder** | TIGER | [Recommender Systems with Generative Retrieval](https://arxiv.org/pdf/2305.05065) | NIPS' 23 | rqvae.py + TIGER.py | ✅ |
+| **Encoder-Retrieval** | RPG | [Generating Long Semantic IDs in Parallel for Recommendation](http://arxiv.org/abs/2506.05781) | KDD' 25 | opq.py + RPG.py | ✅ | 
+| **Quantization** | LETTER | [Learnable Item Tokenization for Generative Recommendation](https://dl.acm.org/doi/10.1145/3627673.3679569) | CIKM' 24 | opq.py + RPG.py | - |
 
 
 
