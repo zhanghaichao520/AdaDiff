@@ -230,14 +230,17 @@ class RVQ(AbstractVQ):
         _, _, codes = self.quantizer(z_e)
         return codes  # [B, num_levels]
 
-    def compute_loss(self, forward_outputs, xs=None, valid=False) -> Dict[str, torch.Tensor]:
-        out, commit_loss, _ = forward_outputs
-        if self.loss_type == "mse":
-            recon = F.mse_loss(out, xs, reduction="mean")
-        elif self.loss_type == "l1":
-            recon = F.l1_loss(out, xs, reduction="mean")
-        else:
-            raise ValueError(f"Unsupported loss_type={self.loss_type}")
-
-        total = recon + self.beta * commit_loss
-        return {"loss_total": total, "loss_recon": recon, "loss_latent": commit_loss}
+    def compute_loss(self, forward_outputs, batch_data=None) -> dict:
+        """ 
+        返回重構 Loss。
+        【已修正】返回 detached 的 Tensor，切斷梯度流。
+        """
+        _, recon_loss, _ = forward_outputs # recon_loss 是一個 Tensor
+        
+        # ✅ 關鍵修正：返回 .detach() 後的 Tensor
+        # 這會告訴 Trainer，這個 loss 不需要用於反向傳播更新參數
+        # Trainer 仍然可以對其 .item()
+        return { 
+            "loss_total": recon_loss.detach(),
+            "loss_recon": recon_loss.detach()
+        }

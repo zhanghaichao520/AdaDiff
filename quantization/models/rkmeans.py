@@ -1,303 +1,380 @@
-# /tokenlization_stage/models/r_kmeans.py
+# File Path: /tokenlization_stage/models/r_kmeans.py (Corrected Version)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Literal
+import logging
+import time # For Debugging
 
+# Assuming abstract_vq is in the same directory or accessible
 from .abstract_vq import AbstractVQ
 
-# -------------------- 距离函数 --------------------
+# --- Distance Functions (with added detach for safety) ---
 def _pairwise_euclidean2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    # a: [B, D], b: [K, D] -> [B, K]
-    return (a.pow(2).sum(-1, keepdim=True) - 2 * a @ b.t() + b.pow(2).sum(-1)).clamp_min_(0.0)
+    """ Calculates squared Euclidean distance between two sets of vectors. """
+    # Ensure calculations don't track gradients unnecessarily
+    with torch.no_grad():
+        a_norm = a.pow(2).sum(-1, keepdim=True)
+        # Detach b to prevent potential gradient issues if b comes from parameters
+        b_detached = b.detach()
+        b_norm = b_detached.pow(2).sum(-1)
+        # Calculate squared distance: a^2 - 2ab + b^2
+        dist = a_norm - 2 * a @ b_detached.t() + b_norm
+    # Clamp after calculation to ensure non-negativity due to floating point errors
+    return dist.clamp_min_(0.0)
 
 def _pairwise_cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    a = F.normalize(a, dim=-1)
-    b = F.normalize(b, dim=-1)
-    return 1.0 - (a @ b.t()).clamp(-1, 1)
+    """ Calculates cosine distance (1 - cosine similarity) """
+    # Ensure calculations don't track gradients unnecessarily
+    with torch.no_grad():
+        # Normalize vectors before dot product
+        a_norm = F.normalize(a, dim=-1)
+        # Detach b
+        b_norm = F.normalize(b.detach(), dim=-1)
+        # Calculate cosine similarity and convert to distance
+        sim = (a_norm @ b_norm.t()).clamp(-1.0, 1.0) # Clamp for numerical stability
+        dist = 1.0 - sim
+    return dist
 
-# -------------------- 主类 --------------------
 class RKMEANS(AbstractVQ):
     """
-    Residual K-Means in 'Hydra-style':
-    - residual quantization with L levels
-    - layer-wise training (train_layer_wise=True): 逐层学习，上一层收敛后再开下一层
-    - KMeans++ init with init buffer (init_buffer_size)
-    - optional residual normalization (normalize_residuals=True)
-    - mini-batch KMeans SGD-like updates (lr=mb_lr), or EMA 更新
-    兼容你的 main/trainer 接口：
-      __init__(config, input_size)
-      forward(xs) -> (x_recon, recon_loss, codes)
-      compute_loss(forward_outputs, batch) -> {'loss_total': ...}
+    Residual K-Means (Corrected Version - Inspired by Grid):
+    - Residual normalization DISABLED by default.
+    - Uses stable EMA updates for centroids.
+    - Optimized empty cluster reseeding.
+    - Layer-wise training.
     """
-
     def __init__(self, config: dict, input_size: Optional[int] = None):
         super().__init__(config)
+        self.logger = logging.getLogger(self.__class__.__name__)
 
-        # 读取配置（兼容 rkmeans / r_kmeans / 顶层）
-        node = (config.get("rkmeans") or config.get("r_kmeans") or {})
+        # --- Read Config (compatible with different naming) ---
+        node = config.get("rkmeans", config.get("r_kmeans", {}))
         mcfg = node.get("model_params", config.get("model_params", {}))
         tcfg = node.get("training_params", config.get("training_params", {}))
 
-        # 模型参数
-        self.code_dim: int = int(input_size if input_size is not None else mcfg.get("code_dim", 64))
-        self.num_levels: int = int(mcfg.get("num_levels", mcfg.get("n_layers", 3)))
-        self.codebook_size: int = int(mcfg.get("codebook_size", mcfg.get("codebook_width", 256)))
-        self.normalize_residuals: bool = bool(mcfg.get("normalize_residuals", True))
-        self.track_residuals: bool = bool(mcfg.get("track_residuals", False))  # 仅日志用途
-        metric: Literal["euclidean", "cosine"] = mcfg.get("distance", "euclidean")
-        self.metric = metric if metric in ("euclidean", "cosine") else "euclidean"
+        # --- Core Model Params ---
+        # Infer code_dim from input_size if provided, otherwise use config
+        self.code_dim: int = int(input_size if input_size is not None else mcfg.get("code_dim", 512))
+        self.num_levels: int = int(mcfg.get("num_levels", 3))
+        self.codebook_size: int = int(mcfg.get("codebook_size", 256))
+        self.logger.info(f"RKMeans Params: Levels={self.num_levels}, K={self.codebook_size}, Dim={self.code_dim}")
+
+        # --- Crucial Configs (Defaults based on Grid/Best Practices) ---
+        self.normalize_residuals: bool = bool(mcfg.get("normalize_residuals", False)) # DEFAULT FALSE
+        metric_str: str = mcfg.get("distance", "cosine") # DEFAULT COSINE
+        self.metric: Literal["euclidean", "cosine"] = metric_str if metric_str in ("euclidean", "cosine") else "cosine"
         self._dist_fn = _pairwise_euclidean2 if self.metric == "euclidean" else _pairwise_cosine
+        if not self.normalize_residuals: self.logger.info("Residual normalization DISABLED (Recommended).")
+        else: self.logger.warning("Residual normalization ENABLED. This might hurt downstream performance.")
+        self.logger.info(f"Using distance metric: {self.metric}")
 
-        # 训练参数
+        # --- Training Configs ---
         self.train_layer_wise: bool = bool(mcfg.get("train_layer_wise", True))
-        self.init_buffer_size: int = int(mcfg.get("init_buffer_size", 3072))
-        self.update_mode: Literal["sgd_like", "ema"] = tcfg.get("update_mode", "sgd_like")
-        self.mb_lr: float = float(tcfg.get("mb_lr", 0.5))          # mini-batch 等效 SGD 学习率
-        self.ema_decay: float = float(tcfg.get("ema_decay", 0.9))  # EMA 衰减
-
-        # 每层训练步数（近似“收敛标准”），达到就切换到下一层
-        self.level_train_steps: int = int(tcfg.get("level_train_steps", 200))
-        # 空簇重启
+        self.init_buffer_size: int = int(mcfg.get("init_buffer_size", 4096))
+        # Force EMA based on best practices
+        self.update_mode: Literal["ema"] = "ema"
+        self.ema_decay: float = float(tcfg.get("ema_decay", 0.99)) # Stable default
+        self.level_train_steps: int = int(tcfg.get("level_train_steps", 1000)) # More steps per level
         self.reseed_empty: bool = bool(tcfg.get("reseed_empty", True))
+        # Ensure reseed_threshold is float
+        self.reseed_threshold: float = float(tcfg.get("reseed_threshold", 1e-5))
+        self.logger.info(f"Update mode: EMA, Decay: {self.ema_decay}, Level steps: {self.level_train_steps}, Reseed empty: {self.reseed_empty} (Threshold: {self.reseed_threshold:.2e})")
 
-        # 码本 & 统计
-        self.codebooks = nn.Parameter(torch.randn(self.num_levels, self.codebook_size, self.code_dim))
-        self.register_buffer("cluster_counts", torch.zeros(self.num_levels, self.codebook_size))  # 使用统计
+        # --- Codebooks & EMA Statistics ---
+        # Codebooks are Parameters for potential gradient flow in recon_loss
+        self.codebooks = nn.Parameter(torch.empty(self.num_levels, self.codebook_size, self.code_dim))
+        nn.init.xavier_uniform_(self.codebooks) # Use Xavier/Glorot initialization
+        # EMA stats are buffers (non-trainable)
+        self.register_buffer("cluster_sums", torch.zeros_like(self.codebooks.data))
+        self.register_buffer("cluster_counts", torch.zeros(self.num_levels, self.codebook_size))
 
-        # 初始化缓存（KMeans++ 用）
+        # --- Initialization State ---
         self.register_buffer("initialized_levels", torch.zeros(self.num_levels, dtype=torch.bool))
-        self._init_buffer = []            # list of tensors (residuals)
-        self._init_buffer_count = 0
+        self._init_buffer = []; self._init_buffer_count = 0
+        self.current_level: int = 0; self.level_steps: int = 0
+        # Track device to ensure consistency
+        self._current_device: Optional[torch.device] = None
 
-        # 逐层训练状态
-        self.current_level: int = 0
-        self.level_steps: int = 0  # 当前层累计训练步数（按 batch 计）
+    @property
+    def is_iterative(self) -> bool:
+         """ RKMeans requires iterative training. """
+         return True
 
-        # usage 正则（可选）：更均匀地使用码字（减少碰撞/未用）
-        self.use_usage_reg: bool = bool(tcfg.get("usage_reg", False))
-        # 分层权重（例如 [0.005, 0.02, 0.04]）
-        self.usage_reg_weights = tcfg.get("usage_reg_weights", None)
-        self.usage_reg_weight: float = float(tcfg.get("usage_reg_weight", 0.01))
-        self._last_usage_hist = None  # forward 缓存
-
-    # -------------------- 工具函数 --------------------
-    @torch.no_grad()
-    def _maybe_collect_init(self, residual: torch.Tensor):
-        """收集初始化缓冲（只在当前层未初始化时生效）"""
-        if self.initialized_levels[self.current_level]:
-            return
-        need = self.init_buffer_size - self._init_buffer_count
-        if need <= 0:
-            return
-        take = min(need, residual.size(0))
-        self._init_buffer.append(residual[:take].detach().clone())
-        self._init_buffer_count += take
-
+    # --- Utility Methods ---
     @torch.no_grad()
     def _kmeanspp_init(self, level: int, data: torch.Tensor):
-        """对指定层用 KMeans++ 初始化，data 是该层的 residual 样本 [N, D]"""
-        N, D = data.shape
-        K = self.codebook_size
-        C = torch.empty(K, D, device=data.device, dtype=data.dtype)
+        """ KMeans++ Initialization (Robust Version). Assumes data is on target device. """
+        N, D = data.shape; K = self.codebook_size
+        target_device = self.codebooks.device
+        C = torch.empty(K, D, device=target_device, dtype=self.codebooks.dtype)
 
-        # 第一个中心
-        idx0 = torch.randint(0, N, (1,), device=data.device)
-        C[0] = data[idx0]
+        # 1. Choose first center randomly
+        idx0 = torch.randint(0, N, (1,), device=data.device); C[0] = data[idx0]
+        min_d2_sum = torch.tensor(float('inf'), device=target_device) # Track sum of squares for stability
 
-        # 迭代选择其余中心
+        # 2. Iteratively choose remaining centers
         for k in range(1, K):
-            dist_to_C = self._dist_fn(data, C[:k])       # [N, k]
-            min_d2 = dist_to_C.min(dim=1).values         # [N]
-            if min_d2.sum() <= 1e-12:
-                rand_idx = torch.randint(0, N, (K - k,), device=data.device)
-                C[k:] = data[rand_idx]
-                break
-            probs = (min_d2 / (min_d2.sum() + 1e-12)).clamp_min_(0)
-            nxt = torch.multinomial(probs, 1)
-            C[k] = data[nxt]
+            # Calculate distance from data points to current centers
+            dist_to_C = self._dist_fn(data, C[:k]) # data & C[:k] are on target_device
+            min_d2 = dist_to_C.min(dim=1).values # Min distance squared for each point
+            current_sum = min_d2.sum()
 
-        self.codebooks.data[level] = C
+            # Stability check: if distances are zero or not decreasing significantly, fall back to random
+            if current_sum <= 1e-9 or not torch.isfinite(current_sum) or \
+               (min_d2_sum.isfinite() and (min_d2_sum - current_sum) < 1e-6 * min_d2_sum):
+                 self.logger.warning(f"KMeans++ stability issue at k={k} for level {level}. Random init for remaining.");
+                 # Use randperm for unique random indices
+                 rand_idx = torch.randperm(N, device=data.device)[:K-k]
+                 C[k:] = data[rand_idx] # Assign remaining centers randomly
+                 break
+            min_d2_sum = current_sum # Update sum for next stability check
+
+            # Sample next centroid using probabilities proportional to squared distance
+            probs = (min_d2 / current_sum).clamp_min_(0)
+            probs /= probs.sum() + 1e-12 # Ensure probabilities sum to 1
+
+            try:
+                 # Multinomial sampling - run on CPU for stability if needed
+                 nxt = torch.multinomial(probs.cpu(), 1).to(data.device) # Sample index
+                 C[k] = data[nxt] # Assign new center
+            except RuntimeError as e: # Catch potential numerical errors in multinomial
+                 self.logger.warning(f"Multinomial sampling failed at k={k} for level {level}: {e}. Using random index.")
+                 rand_idx = torch.randint(0, N, (1,), device=data.device)
+                 C[k] = data[rand_idx]
+
+        # 3. Update codebook parameter and reset EMA stats
+        self.codebooks.data[level].copy_(C)
         self.initialized_levels[level] = True
+        self.cluster_sums[level].zero_()
+        self.cluster_counts[level].zero_()
+        self.logger.info(f"Level {level} initialized via KMeans++.")
+
+    @torch.no_grad()
+    def _maybe_collect_init(self, residual: torch.Tensor):
+        """ Collect data for initialization buffer (store on CPU). """
+        if self.initialized_levels[self.current_level]: return
+        need = self.init_buffer_size - self._init_buffer_count;
+        if need <= 0: return
+        take = min(need, residual.size(0));
+        # Store detached tensor on CPU to save GPU memory
+        self._init_buffer.append(residual[:take].detach().clone().cpu());
+        self._init_buffer_count += take
+        # self.logger.debug(f"Collected init buffer: {self._init_buffer_count}/{self.init_buffer_size}") # Optional debug log
 
     @torch.no_grad()
     def _layer_init_if_needed(self, residual: torch.Tensor):
-        """当前层如果未初始化，等缓冲攒够后做 KMeans++ 初始化"""
+        """ Initialize the current layer using KMeans++ if buffer is full. """
         l = self.current_level
-        if self.initialized_levels[l]:
-            return
+        # Skip if already initialized or training is finished
+        if self.initialized_levels[l] or l >= self.num_levels: return
+        # Collect data into buffer
         self._maybe_collect_init(residual)
+        # If buffer is full, perform initialization
         if self._init_buffer_count >= self.init_buffer_size:
-            buf = torch.cat(self._init_buffer, dim=0)[: self.init_buffer_size]
+            # Concatenate CPU buffer and move to target device
+            buf = torch.cat(self._init_buffer, dim=0)[: self.init_buffer_size].to(self.codebooks.device)
+            self.logger.info(f"Initializing level {l} with KMeans++ (buffer size {buf.shape[0]})...")
+            # Call KMeans++ init
             self._kmeanspp_init(l, buf)
-            # 用完清空缓冲
-            self._init_buffer.clear()
-            self._init_buffer_count = 0
+            # Clear buffer after use
+            self._init_buffer.clear(); self._init_buffer_count = 0
 
     @torch.no_grad()
-    def _mini_batch_update(self, level: int, batch: torch.Tensor, assign_idx: torch.Tensor):
-        """
-        基于硬分配的 mini-batch 更新（更贴近原始 MiniBatchKMeans）
-        """
+    def _ema_update(self, level: int, batch: torch.Tensor, assign_idx: torch.Tensor):
+        """ EMA update for centroids, inspired by grid """
         K = self.codebook_size
-        one_hot = F.one_hot(assign_idx, num_classes=K).to(batch.dtype)  # [B, K]
-        counts = one_hot.sum(dim=0)                                     # [K]
-        sums = one_hot.t() @ batch                                      # [K, D]
+        target_device = self.codebooks.device # Use codebook's device
 
-        used = counts > 0
-        if used.any():
-            batch_mean = sums[used] / counts[used].unsqueeze(1)         # [Ku, D]
-            if self.update_mode == "ema":
-                self.codebooks.data[level][used] = (
-                    self.ema_decay * self.codebooks.data[level][used]
-                    + (1 - self.ema_decay) * batch_mean
-                )
-            else:
-                # SGD-like: C <- (1-η)C + η*batch_mean
-                eta = self.mb_lr
-                self.codebooks.data[level][used] = (
-                    (1 - eta) * self.codebooks.data[level][used] + eta * batch_mean
-                )
-            self.cluster_counts[level, used] += counts[used]
+        # Ensure inputs are on the target device
+        batch = batch.to(target_device)
+        assign_idx = assign_idx.to(target_device)
 
-        # 空簇重启
-        if self.reseed_empty:
-            empty = self.cluster_counts[level] == 0
-            if empty.any():
-                # 用 batch 的随机样本回填
-                ridx = torch.randint(0, batch.size(0), (int(empty.sum()),), device=batch.device)
-                self.codebooks.data[level][empty] = batch[ridx]
-                # 给一个小的 count，避免再次被当作空簇
-                self.cluster_counts[level][empty] = 1.0
+        # --- Calculate Batch Statistics ---
+        one_hot = F.one_hot(assign_idx, num_classes=K).to(batch.dtype) # (B, K)
+        batch_counts = one_hot.sum(dim=0)                                    # (K,) Sum of assignments per cluster
+        batch_sums = one_hot.t() @ batch                                     # (K, D) Sum of vectors per cluster
 
-        # 返回 batch 使用直方图（用于 usage 正则）
-        hist = counts / (counts.sum() + 1e-12)
-        return hist  # [K]
+        # --- EMA Update Global Statistics (In-place) ---
+        decay = self.ema_decay
+        # Update sums: sums = decay * sums + (1 - decay) * batch_sums
+        self.cluster_sums[level].mul_(decay).add_(batch_sums, alpha=1 - decay)
+        # Update counts: counts = decay * counts + (1 - decay) * batch_counts
+        self.cluster_counts[level].mul_(decay).add_(batch_counts, alpha=1 - decay)
 
-    # -------------------- 前向（训练/推理通用） --------------------
+        # --- Calculate New Centroids ---
+        # Get EMA counts, add small epsilon for stability
+        normalized_counts = self.cluster_counts[level].unsqueeze(1).clamp_min_(1e-10)
+        # Calculate centroids: sums / counts
+        new_centroids = self.cluster_sums[level] / normalized_counts
+
+        # Update codebook parameter data using copy_
+        self.codebooks.data[level].copy_(new_centroids)
+
+        # --- Reseed Near-Empty Clusters ---
+        # Reseed only after some initial steps to allow counts to stabilize
+        if self.reseed_empty and self.level_steps > K * 2:
+            # Identify clusters with EMA count below threshold
+            near_empty_mask = self.cluster_counts[level] < self.reseed_threshold
+            if near_empty_mask.any():
+                num_empty = int(near_empty_mask.sum())
+                self.logger.warning(f"Level {level}: Reseeding {num_empty} near-empty clusters (count < {self.reseed_threshold:.2e})...")
+
+                # Reseed with random points from the current batch
+                # Ensure random indices are valid and on the correct device
+                ridx = torch.randint(0, batch.size(0), (num_empty,), device=batch.device)
+                reseed_vectors = batch[ridx]
+
+                # Update codebook centroids
+                self.codebooks.data[level][near_empty_mask] = reseed_vectors
+                # Reset EMA stats for reseeded clusters to a small initial value (like one sample)
+                # alpha = 1 - decay helps initialize the EMA correctly
+                self.cluster_sums.data[level][near_empty_mask] = reseed_vectors * (1 - decay)
+                self.cluster_counts.data[level][near_empty_mask] = (1 - decay)
+
+    # --- Forward Pass ---
     def forward(self, xs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        xs: [B, D]
-        返回:
-          x_recon: [B, D]
-          recon_loss: 标量 MSE
-          codes: [B, L] （未训练到的层，用 0 填充）
+        Performs residual quantization. Updates centroids during training.
+        Returns: (reconstruction, reconstruction_loss_mse, codes)
         """
         B, D = xs.shape
-        assert D == self.code_dim, f"Input dim {D} != code_dim {self.code_dim}"
+        if D != self.code_dim:
+            raise ValueError(f"Input dimension {D} != model code_dim {self.code_dim}")
 
-        device = xs.device
-        residual = xs
-        if self.normalize_residuals:
-            # 零均值、单位方差（按 batch）
-            mean = residual.mean(dim=0, keepdim=True)
-            std = residual.std(dim=0, keepdim=True).clamp_min_(1e-6)
-            residual = (residual - mean) / std
+        # Ensure model parameters & buffers are on the same device as input
+        current_device = xs.device
+        if self._current_device is None or self._current_device != current_device:
+             # This moves the nn.Parameter and registered buffers
+             self.to(current_device)
+             self._current_device = current_device
+             self.logger.info(f"Moved RKMeans model to device: {current_device}")
 
+        # --- Prepare Initial Residual (NO normalization by default) ---
+        if self.normalize_residuals: # Should be False by default
+            mean = xs.mean(dim=0, keepdim=True); std = xs.std(dim=0, keepdim=True).clamp_min_(1e-6)
+            original_input_for_loss = (xs - mean) / std # Loss calculated on normalized input
+        else:
+            original_input_for_loss = xs # Loss calculated on original input
+
+        current_residual = original_input_for_loss.clone() # Residual calculation starts here
+
+        # Initialize outputs
         x_recon = torch.zeros_like(xs)
-        codes = torch.zeros(B, self.num_levels, dtype=torch.long, device=device)
-        usage_hists = []
+        codes = torch.zeros(B, self.num_levels, dtype=torch.long, device=current_device)
 
-        # 先“通过已训练层”进行量化（不更新）→ 得到当前层的 residual
-        for l in range(self.num_levels):
-            C = self.codebooks[l]  # [K, D]
+        # Determine active levels based on layer-wise training state
+        active_levels_range = range(self.num_levels) if not self.train_layer_wise else range(self.current_level + 1)
+
+        for l in active_levels_range:
+            # --- Initialize layer if needed (during training, only for current level) ---
+            if self.training and self.train_layer_wise and l == self.current_level:
+                # Pass residual detached, init doesn't need grads
+                self._layer_init_if_needed(current_residual.detach())
+
+            # Skip quantization if layer is not initialized
             if not self.initialized_levels[l]:
-                break
-            dist = self._dist_fn(residual, C)   # [B, K]
-            idx = dist.argmin(dim=1)            # 硬分配
-            q = F.embedding(idx, C)
-            x_recon = x_recon + q
-            residual = residual - q
+                 # If training, still collect buffer for the layer to be initialized
+                 if self.training and self.train_layer_wise and l == self.current_level:
+                     self._maybe_collect_init(current_residual.detach())
+                 continue # Move to next layer
+
+            # --- Quantization Step ---
+            # Get centroids detached for distance calculation (no gradient needed here)
+            C = self.codebooks.data[l].detach()
+            # Calculate distances using detached residual (no gradient needed here)
+            dist = self._dist_fn(current_residual.detach(), C)
+            idx = dist.argmin(dim=1) # Hard assignment indices
+
+            # Get quantized vector using Parameter (connects gradient for recon_loss)
+            q = F.embedding(idx, self.codebooks[l])
+
+            # --- Update Reconstruction and Residual ---
+            x_recon = x_recon + q # Accumulate reconstruction
+            # Store residual *before* subtracting q, needed for EMA update
+            residual_before_quant = current_residual.clone()
+            # Update residual for *next* layer's input, detaching q
+            current_residual = current_residual - q.detach()
+            # Store codes
             codes[:, l] = idx
 
-            # 已训练层不再更新，usage 仅用于日志
-            hist = (F.one_hot(idx, num_classes=self.codebook_size).float().sum(dim=0))
-            hist = (hist / (hist.sum() + 1e-12)).detach()
-            usage_hists.append(hist)
+            # --- Update Centroids (EMA, only if training current layer) ---
+            if self.training and self.train_layer_wise and l == self.current_level:
+                # Update based on residual *before* quantization for level l
+                self._ema_update(l, residual_before_quant, idx)
+                self.level_steps += 1 # Increment steps for current level
 
-        # 处理“当前正在训练的层”
-        if self.train_layer_wise and (self.current_level < self.num_levels):
-            l = self.current_level
-            # 初始化不足则先攒 buffer
-            self._layer_init_if_needed(residual)
-            if self.initialized_levels[l]:
-                C = self.codebooks[l]
-                dist = self._dist_fn(residual, C)
-                idx = dist.argmin(dim=1)
-                q = F.embedding(idx, C)
-                x_recon = x_recon + q
-                residual = residual - q
-                codes[:, l] = idx
+                # Check if current level training is complete
+                if self.level_steps >= self.level_train_steps and self.current_level < self.num_levels:
+                    self.logger.info(f"Level {self.current_level} trained for {self.level_steps} steps. Moving to level {self.current_level + 1}.")
+                    self.current_level += 1 # Move to next level
+                    self.level_steps = 0    # Reset step counter
+                    # If there are more levels, clear init buffer for the next level
+                    if self.current_level < self.num_levels:
+                         self._init_buffer.clear(); self._init_buffer_count = 0
+                         # Try to collect for next layer immediately using current residual
+                         # Use clone().detach() to avoid modifying current_residual inplace issues
+                         self._maybe_collect_init(current_residual.clone().detach())
+                    else:
+                         self.logger.info("All levels trained.")
+                         # Training finished for all layers
 
-                # 只更新当前层
-                hist = self._mini_batch_update(l, residual + q, idx)  # 用量化前的该层输入 (= old residual)
-                usage_hists.append(hist)
+        # Calculate reconstruction loss based on the input used for the first residual
+        recon_loss = F.mse_loss(x_recon, original_input_for_loss)
 
-                # 累计步数并考虑“切层”
-                self.level_steps += 1
-                if self.level_steps >= self.level_train_steps:
-                    # 切到下一层
-                    self.current_level = min(self.current_level + 1, self.num_levels - 1)
-                    self.level_steps = 0
-                    # 清空下一层的初始化缓冲
-                    self._init_buffer.clear()
-                    self._init_buffer_count = 0
-
-        # 未到达/未训练的后续层：codes 留 0 占位；x_recon 不叠加（等后续训练）
-
-        # 重构误差（对当前已叠加的层）
-        recon_loss = F.mse_loss(x_recon, xs)
-
-        # 缓存 usage（可能用于 usage 正则）
-        self._last_usage_hist = usage_hists if usage_hists else None
-
+        # Return tuple: (reconstruction, loss, codes)
         return x_recon, recon_loss, codes
 
+    # --- Inference Method ---
     @torch.no_grad()
     def get_codes(self, xs: torch.Tensor) -> torch.Tensor:
-        # 推理阶段：用已训练的所有层逐层量化
-        residual = xs
+        """ Encodes input vectors into discrete codes using all trained levels. """
+        self.eval() # Ensure model is in eval mode
+        B, D = xs.shape; device = xs.device
+        if D != self.code_dim: raise ValueError(f"Input dim {D} mismatch in get_codes")
+
+        # Ensure model parameters & buffers are on the same device as input
+        if self._current_device is None or self._current_device != device:
+             self.to(device)
+             self._current_device = device
+             # self.logger.debug(f"Moved RKMeans model to device: {device} during get_codes")
+
+        # --- Prepare Initial Residual (Consistent with forward, default NO normalization) ---
         if self.normalize_residuals:
-            mean = residual.mean(dim=0, keepdim=True)
-            std = residual.std(dim=0, keepdim=True).clamp_min_(1e-6)
-            residual = (residual - mean) / std
+             # Using batch stats during inference - potential mismatch with training if stats differ
+             mean=xs.mean(dim=0, keepdim=True); std=xs.std(dim=0, keepdim=True).clamp_min_(1e-6)
+             residual = (xs - mean) / std
+        else:
+             residual = xs.clone() # Use original input
 
-        B = xs.size(0)
-        device = xs.device
         codes = torch.zeros(B, self.num_levels, dtype=torch.long, device=device)
-
         for l in range(self.num_levels):
-            C = self.codebooks[l]
+            # Skip uninitialized levels, codes remain 0
+            if not self.initialized_levels[l]: continue
+            # Use codebook data directly for inference (no gradients needed)
+            C = self.codebooks.data[l]
+            # Calculate distance and find nearest centroid
             dist = self._dist_fn(residual, C)
             idx = dist.argmin(dim=1)
             codes[:, l] = idx
+            # Update residual using codebook data (F.embedding works with .data)
             q = F.embedding(idx, C)
-            residual = residual - q
-
+            residual = residual - q # Update residual for the next level
+            
         return codes
 
+    # --- Loss Computation for Trainer ---
+    # --- Loss 計算 ---
     def compute_loss(self, forward_outputs, batch_data=None) -> dict:
+        """ 
+        返回重構 Loss。
+        【已修正】返回 Tensor，而不是 float，以便 Trainer 進行反向傳播或日誌記錄。
         """
-        兼容你的 Trainer 调用：loss_dict = model.compute_loss(forward_outputs, batch)
-        forward_outputs: (x_recon, recon_loss, codes)
-        """
-        _, recon_loss, _ = forward_outputs
-        loss = recon_loss
-
-        # 可选：分层 usage 正则（提升码字使用熵，减少未用/碰撞）
-        if self.use_usage_reg and (self._last_usage_hist is not None):
-            if isinstance(self.usage_reg_weights, list):
-                w_list = [float(w) for w in self.usage_reg_weights]
-            else:
-                w_list = None
-            for l, hist in enumerate(self._last_usage_hist):
-                p = hist.clamp_min(1e-12)
-                usage_loss = (p * p.log()).sum()  # = -H 的负号
-                w = (w_list[l] if (w_list is not None and l < len(w_list)) else self.usage_reg_weight)
-                loss = loss + w * usage_loss
-
-        return {
-            "loss_total": loss,
-            "loss_recon": recon_loss  # 新增：显式返回重构误差
+        _, recon_loss, _ = forward_outputs # recon_loss 是一個 Tensor
+        
+        # ✅ 關鍵修正：直接返回 Tensor
+        return { 
+            "loss_total": recon_loss, # 返回原始的 loss Tensor
+            "loss_recon": recon_loss  # 返回原始的 loss Tensor
         }
-
