@@ -10,42 +10,73 @@ import torch
 import logging
 from pathlib import Path
 import importlib
+from collections.abc import Mapping
 
-VALID_QUANT_METHODS = {"rkmeans", "rvq", "rqvae"}
+VALID_QUANT_METHODS = {"rkmeans", "rvq", "rqvae", "opq", "pq"}
 
 def _ensure_dir_exists(dir_path: Path):
     """确保目录存在"""
     if dir_path:
         dir_path.mkdir(parents=True, exist_ok=True)
 
-def _load_rqvae_details(path: str) -> dict:
-    """从 RQ-VAE 配置文件中加载必要的参数"""
+def _recursive_update(base_dict: dict, new_dict: dict) -> dict:
+    """
+    遞迴地更新字典。
+    如果 new_dict 中的鍵在 base_dict 中也存在且對應的值都是字典，
+    則遞迴地合併它們，否則直接用 new_dict 的值覆蓋 base_dict 的值。
+    """
+    for key, value in new_dict.items():
+        if isinstance(value, Mapping) and key in base_dict and isinstance(base_dict[key], Mapping):
+            base_dict[key] = _recursive_update(base_dict[key], value)
+        else:
+            base_dict[key] = value
+    return base_dict
+
+
+def _load_quant_details(path: str, quant_method: str) -> dict:
+    """
+    從指定的 YAML 檔案中，根據 quant_method 載入對應的參數。
+    """
     if not Path(path).is_file():
-        raise FileNotFoundError(f"[Config] 未找到 RQ-VAE 配置文件: {path}")
+        raise FileNotFoundError(f"[Config] 根據約定，未找到量化設定檔: {path}")
+    
     with open(path, 'r') as f:
         cfg = yaml.safe_load(f)
-    if 'rqvae' not in cfg or 'model_params' not in cfg['rqvae']:
-        raise ValueError(f"[Config] {path} 缺少 rqvae.model_params 节点")
-    mp = cfg['rqvae']['model_params']
-    return {
-        'codebook_size': int(mp['codebook_size']),
-        'num_levels': int(mp['num_levels']),
-    }
+        
+    if quant_method not in cfg or 'model_params' not in cfg[quant_method]:
+        raise ValueError(f"[Config] 在 {path} 中缺少 '{quant_method}.model_params' 節點")
+    
+    mp = cfg[quant_method]['model_params']
+    required_keys = ['codebook_size', 'num_levels']
+    if not all(key in mp for key in required_keys):
+         raise ValueError(f"[Config] 在 {path} 的 model_params 中缺少 'codebook_size' 或 'num_levels'")
+
+    return mp
+
 
 def load_and_process_config(model_name: str, dataset_name: str, quant_method: str) -> dict:
     """
-    通用配置加载器。
-    1. 加载模型的基础 YAML 文件 (e.g., configs/TIGER.yaml)。
-    2. 使用命令行参数 (dataset, quant_method) 填充路径模板。
-    3. 推导词表大小和相关参数。
-    4. 校验文件和路径。
+    通用配置加载器 (V6 - 支援 base.yaml 繼承與覆蓋)。
     """
-    # === 1. 加载模型的基础 YAML 文件 ===
-    config_path = Path(f"configs/{model_name}.yaml")
-    if not config_path.is_file():
-        raise FileNotFoundError(f"模型配置文件未找到: {config_path}")
-    with open(config_path, 'r') as f:
+    # === 1. ✅ 關鍵改動 2：依序載入 base 和 model-specific 設定檔 ===
+    # 載入基礎設定檔
+    base_config_path = Path("configs/base.yaml")
+    if not base_config_path.is_file():
+        raise FileNotFoundError(f"基礎設定檔未找到: {base_config_path}")
+    with open(base_config_path, 'r') as f:
         config = yaml.safe_load(f)
+
+    # 載入特定模型設定檔
+    model_config_path = Path(f"configs/{model_name}.yaml")
+    if not model_config_path.is_file():
+        raise FileNotFoundError(f"模型配置文件未找到: {model_config_path}")
+    with open(model_config_path, 'r') as f:
+        model_config = yaml.safe_load(f)
+        
+    # ✨ 使用遞迴更新，讓 model_config 覆蓋 base_config
+    config = _recursive_update(config, model_config)
+
+    # === 後續流程完全不變，它們現在操作的是已經合併好的 config ===
     
     config['model_name'] = model_name
     config['dataset_name'] = dataset_name
@@ -54,73 +85,73 @@ def load_and_process_config(model_name: str, dataset_name: str, quant_method: st
     if config['quant_method'] not in VALID_QUANT_METHODS:
         raise ValueError(f"不支持的量化方法: {quant_method}。可选: {VALID_QUANT_METHODS}")
 
-    # === 2. 格式化和派生路径 ===
-    paths = config['paths']
-    format_args = {'dataset_name': dataset_name, 'quant_method': config['quant_method']}
+    # 2. 獨立地載入量化設定檔
+    quant_config_path = Path(f"../quantization/configs/{quant_method}_config.yaml")
+    quant_details = _load_quant_details(quant_config_path, config['quant_method'])
     
+    # === 3. 格式化和派生「數據」與「輸出」的路徑 ===
+    # 這部分的路徑模板仍然來自 TIGER.yaml，是合理的，因為它定義了數據存放格式
+    # 3. 格式化路徑
+    paths = config['paths']
+    # ✅ 將 model_name 加入字典
+    format_args = {
+        'dataset_name': dataset_name, 
+        'quant_method': config['quant_method'], 
+        'model_name': model_name
+    }
     dataset_root = Path(paths['dataset_root'].format(**format_args))
     output_root = Path(paths['output_root'].format(**format_args))
 
     config['code_path'] = paths['codebook_template'].format(dataset_root=dataset_root, **format_args)
     config['log_path'] = output_root / "training.log"
     config['save_path'] = output_root / "best_model.pth"
-    
     config['train_json'] = dataset_root / f"{dataset_name}.train.jsonl"
     config['valid_json'] = dataset_root / f"{dataset_name}.valid.jsonl"
     config['test_json'] = dataset_root / f"{dataset_name}.test.jsonl"
-
     _ensure_dir_exists(output_root)
 
-    # === 3. 加载量化参数并推导词表 ===
-    if config['quant_method'] == "rqvae":
-        rq_details = _load_rqvae_details(paths['rqvae_config_path'])
-    else:
-        # 从模型配置中获取非 RQ-VAE 方法的默认值
-        rq_details = config['quantization_defaults']
-        
-    K, L = int(rq_details['codebook_size']), int(rq_details['num_levels'])
+    # === 4. 根據載入的量化細節，計算詞表參數 ===
+    K = int(quant_details['codebook_size'])
+    num_semantic_levels = int(quant_details['num_levels'])
+    has_dup_layer = quant_details.get('has_dup_layer', True) 
+    
     config['codebook_size'] = K
-    config['num_levels'] = L
+    config['num_semantic_levels'] = num_semantic_levels
 
-    # === 4. 读取 codebook 并进行校验 ===
+    # === 5. 校验 codebook 檔案 ===
     if not Path(config['code_path']).is_file():
         raise FileNotFoundError(f"[FATAL] 未找到 codebook: {config['code_path']}")
-        
     codes_arr = np.load(config['code_path'], allow_pickle=True)
     codes_mat = np.vstack(codes_arr) if codes_arr.dtype == object else codes_arr
     
-    if not np.issubdtype(codes_mat.dtype, np.integer):
-        raise ValueError("[FATAL] Codebook 文件应为整数 token，实际为非整型")
-    if codes_mat.ndim != 2 or codes_mat.shape[1] != 4: # 假设 code 长度固定为 4
-        raise ValueError(f"[FATAL] 期望 codebook 形状为 (N, 4)，实际为 {codes_mat.shape}")
+    expected_code_len = num_semantic_levels + 1 if has_dup_layer else num_semantic_levels
+    config['code_len'] = expected_code_len
 
-    # === 5. 计算最终词表参数 ===
-    # 基于第4列（dup列）计算去重词表大小
-    dup_max = int(codes_mat[:, 3].max()) if codes_mat.size > 0 else 0
-    dup_vocab_size = dup_max + 1
-    config['dup_vocab_size'] = dup_vocab_size
+    if codes_mat.ndim != 2 or codes_mat.shape[1] != expected_code_len:
+        raise ValueError(f"[FATAL] Codebook {config['code_path']} 的期望形状為 (N, {expected_code_len})，實際為 {codes_mat.shape}")
 
-    # 词表与基数 (前3列为语义层, 第4列为dup层)
-    config['code_len'] = 4
-    config['vocab_sizes'] = [K, K, K, dup_vocab_size]
-    config['bases'] = [0, K, 2 * K, 3 * K]
+    # === 6. 計算最終詞表參數 ===
+    if has_dup_layer:
+        dup_max = int(codes_mat[:, -1].max()) if codes_mat.size > 0 else 0
+        dup_vocab_size = dup_max + 1
+        config['dup_vocab_size'] = dup_vocab_size
+        vocab_sizes = [K] * num_semantic_levels + [dup_vocab_size]
+    else:
+        vocab_sizes = [K] * num_semantic_levels
+    config['vocab_sizes'] = vocab_sizes
+
+    bases = np.cumsum([0] + vocab_sizes[:-1]).tolist()
+    config['bases'] = [int(b) for b in bases]
 
     max_token_id = sum(config['vocab_sizes'])
     eos_id = max_token_id + 1
     
-    # 将最终的词表相关 ID 添加到 config 中
     config['token_params'] = {
-        'pad_token_id': 0,
-        'eos_token_id': eos_id,
-        # 总词表大小 = 最大 token ID + EOS + PAD + 一些预留位
-        'vocab_size': eos_id + 5 
+        'pad_token_id': 0, 'eos_token_id': eos_id, 'vocab_size': eos_id + 5 
     }
     
-    # 打印最终配置以供调试
-    # import json
-    # print(json.dumps(config, indent=2, default=str))
-
     return config
+
 
 # --- 日志和随机种子函数保持不变 ---
 def setup_logging(log_path: Path):

@@ -1,0 +1,26 @@
+# 檔案路徑: configs/base.yaml
+
+# 訓練相關的通用預設值
+training_params:
+  lr: 0.001
+  batch_size: 128
+  num_epochs: 200
+  early_stop: 10
+  seed: 2023
+  device: 'cuda:0'
+  num_workders: 32
+
+model_params:
+  max_len: 20
+
+# 評估相關的通用預設值
+evaluation_params:
+  topk_list: [5, 10, 20]
+  beam_size: 20
+  batch_size: 256
+
+# 所有模型共享的路徑模板
+paths:
+  dataset_root: "../datasets/{dataset_name}"
+  output_root: "../ckpt/recommendation/{dataset_name}/{model_name}_{quant_method}"
+  codebook_template: "{dataset_root}/codebooks/{dataset_name}.{quant_method}.codebook.npy"

@@ -17,36 +17,32 @@ def pad_or_truncate(sequence, max_len, PAD_TOKEN=0):
 
 def item2code(code_path, vocab_sizes, bases):
     """
-    将 codebook 的每一行 [c0, c1, c2, dup] 编码为 4 个 token：
-      token_i = raw_i + bases[i] + 1
-    其中 0 留给 PAD。
+    【已自適應】將 codebook 的每一行 [c0, c1, ..., dup] 编码為 N 個 token。
     """
     data = np.load(code_path, allow_pickle=True)
     mat = np.vstack(data) if data.dtype == object else data
-    assert mat.shape[1] == 4, f"Expect 4 columns in codebook, got {mat.shape[1]}"
-
-    K0, K1, K2, K3 = map(int, vocab_sizes)
-    B0, B1, B2, B3 = map(int, bases)
+    
+    num_levels = len(vocab_sizes) # ✅ 從傳入的參數動態獲取總長度
+    assert mat.shape[1] == num_levels, f"Expect {num_levels} columns in codebook, got {mat.shape[1]}"
 
     item_to_code = {}
     code_to_item = {}
 
-    for index, row in enumerate(mat):  # 假定 item_id = index + 1
-        c0, c1, c2, dup = map(int, row.tolist())
+    for index, row in enumerate(mat):
+        # ✅ 關鍵改動：使用迴圈處理任意長度的 code
+        code_values = [int(c) for c in row]
+        
+        # 範圍校驗
+        for i, code_val in enumerate(code_values):
+            if not (0 <= code_val < vocab_sizes[i]):
+                raise ValueError(f"Out-of-range code {code_val} at index {i} for row {row} with vocab_sizes={vocab_sizes}")
 
-        # 范围校验
-        if not (0 <= c0 < K0 and 0 <= c1 < K1 and 0 <= c2 < K2 and 0 <= dup < K3):
-            raise ValueError(f"Out-of-range codes {row} with vocab_sizes={vocab_sizes}")
-
-        t0 = c0 + B0 + 1
-        t1 = c1 + B1 + 1
-        t2 = c2 + B2 + 1
-        t3 = dup + B3 + 1
-
-        offsets = [t0, t1, t2, t3]
+        # Token 偏移計算
+        tokens = [code_val + bases[i] + 1 for i, code_val in enumerate(code_values)]
+        
         item_id = index + 1
-        item_to_code[item_id] = offsets
-        code_to_item[tuple(offsets)] = item_id
+        item_to_code[item_id] = tokens
+        code_to_item[tuple(tokens)] = item_id
 
     return item_to_code, code_to_item
 
@@ -113,74 +109,63 @@ def process_jsonl(file_path, max_len, PAD_TOKEN=0):
 # 统一 Dataset
 # -----------------------------
 class GenRecDataset(Dataset):
-    def __init__(self, dataset_path, code_path, mode, max_len, PAD_TOKEN=0,
-                 vocab_sizes=None, bases=None, input_format=None):
-        self.dataset_path = dataset_path
-        self.code_path = code_path
+    """
+    【最終推薦版 - 兼容 TIGER & RPG】
+    此版本在初始化時根據 config 加載原始數據和 item2code 映射，
+    並在 __getitem__ 中返回所有下游 collate_fn 可能需要的數據格式。
+    """
+    def __init__(self, config: dict, mode: str):
+        self.config = config
         self.mode = mode
-        self.max_len = max_len
-        self.PAD_TOKEN = PAD_TOKEN
-
-        assert vocab_sizes is not None and bases is not None, \
-            "Must pass vocab_sizes and bases from main.py"
-        self.vocab_sizes = vocab_sizes
-        self.bases = bases
-        self.num_levels = len(self.vocab_sizes)  # ✅ 补上
-
-
-        # 加载 codebook 映射（按位偏移编码）
-        self.item_to_code, self.code_to_item = item2code(
-            code_path, vocab_sizes=self.vocab_sizes, bases=self.bases
+        self.dataset_path = self.config[f'{mode}_json']
+        self.max_len = self.config['model_params']['max_len']
+        # ✅ 需要 PAD_TOKEN ID
+        self.PAD_TOKEN_ID = self.config['token_params']['pad_token_id'] 
+        
+        # ✅ 關鍵改動：在 __init__ 中載入 item2code 映射
+        self.vocab_sizes = self.config['vocab_sizes']
+        self.bases = self.config['bases']
+        self.num_levels = len(self.vocab_sizes)
+        self.item_to_code, _ = item2code(
+            self.config['code_path'], self.vocab_sizes, self.bases
         )
-
-        # 自动判断/显式指定输入格式
-        if input_format is None:
-            ext = os.path.splitext(dataset_path)[1].lower()
-            if ext == ".jsonl":
-                input_format = "jsonl"
-            elif ext == ".parquet":
-                input_format = "parquet"
-            else:
-                raise ValueError(f"Unknown file extension for dataset_path: {dataset_path}")
-
-        self.input_format = input_format
-
-        # 预处理
-        if self.input_format == "jsonl":
-            # JSONL 不需要 mode；不滑窗
-            processed = process_jsonl(
-                self.dataset_path, self.max_len, self.PAD_TOKEN
-            )
-        elif self.input_format == "parquet":
-            processed = process_parquet(
-                self.dataset_path, self.mode, self.max_len, self.PAD_TOKEN
-            )
-        else:
-            raise ValueError("input_format must be 'jsonl' or 'parquet'.")
-
-        # itemID -> code 映射
-        self.data = []
-        for item in processed:
-            hist_ids = item['history']
-            tgt_id = item['target']
-
-            # 把每个 itemID 映射成 num_levels 长度的 code 列表
-            hist_codes = [
-                self.item_to_code.get(int(x) + 1, [self.PAD_TOKEN]*self.num_levels) for x in hist_ids
-            ]
-            tgt_code = self.item_to_code.get(int(tgt_id) + 1, [self.PAD_TOKEN]*self.num_levels)
-
-
-            self.data.append({
-                'history': hist_codes,   # [[l1,l2,...], [l1,l2,...], ...]
-                'target': tgt_code       # [t1,t2,...]
-            })
-
-    def __getitem__(self, index):
-        return self.data[index]
+        
+        # 載入原始數據 (Item IDs)
+        # 注意: process_jsonl 返回的是 {'history': [padded_0based_ids], 'target': 0based_id}
+        self.raw_data = process_jsonl(self.dataset_path, self.max_len, PAD_TOKEN=0) # Item ID 用 0 做 padding
 
     def __len__(self):
-        return len(self.data)
+        return len(self.raw_data)
+
+    def __getitem__(self, index):
+        # 獲取原始數據 (已經 padding 過的 0-based ID 序列)
+        item = self.raw_data[index]
+        hist_ids_0based_padded = item['history']
+        tgt_id_0based = item['target']
+
+        # --- 動態準備 Code Tokens ---
+        code_pad_token_list = [self.PAD_TOKEN_ID] * self.num_levels
+        # ✅ 使用 padding 過的 history ID 進行查找，遇到 0 (padding ID) 時返回 padding code
+        hist_codes = [self.item_to_code.get(x + 1, code_pad_token_list) if x != 0 else code_pad_token_list 
+                      for x in hist_ids_0based_padded]
+        tgt_code = self.item_to_code.get(tgt_id_0based + 1, code_pad_token_list)
+        
+        # --- 準備 1-based Item IDs (去除 padding) ---
+        hist_ids_1based = [x + 1 for x in hist_ids_0based_padded if x != 0]
+
+        # ✅ 返回所有可能需要的數據
+        return {
+            # 原始 0-based ID 序列 (含 padding)，用於可能的未來模型
+            'history_raw_padded': hist_ids_0based_padded, 
+            # 1-based 原始 ID 序列 (不含 padding)，用於 RPG collate
+            'hist_ids': hist_ids_1based,    
+            # Code Token 序列 (含 padding code)，用於 TIGER collate
+            'history': hist_codes,          
+            # Target Code Token
+            'target_code': tgt_code,        
+            # 0-based Target 原始 ID
+            'target_id': tgt_id_0based      
+        }
 
 
 # --------------- 简单自测 ---------------

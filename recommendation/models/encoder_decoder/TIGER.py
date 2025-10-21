@@ -1,49 +1,47 @@
-# models/tiger.py
+# models/tiger.py (遵守新契约)
 
-from typing import Any, Dict
-
+from typing import Any, Dict, List
 import torch
 import transformers
-from ..abstract_model import AbstractModel # 假設 abstract_model 在同級目錄
 
-# 從 transformers 庫直接導入 T5 模型和配置
+# 明确地从升级后的 abstract_model 导入
+from ..abstract_model import AbstractModel 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from metrics import recall_at_k, ndcg_at_k
+
+
 T5ForConditionalGeneration = transformers.T5ForConditionalGeneration
 T5Config = transformers.T5Config
 
-
+# TIGER 现在继承自我们定义好的 ABC
 class TIGER(AbstractModel):
-  """
-  一個通用的、由配置驅動的 T5 模型封裝，用於 GenRec。
-  """
-
+  
   def __init__(self, config: Dict[str, Any]):
-    """
-    僅透過 config 字典初始化模型。
-    所有必要的參數（模型結構、詞表大小等）都應包含在 config 中。
-
-    Args:
-        config (Dict[str, Any]): 包含所有超參數的字典。
-    """
-    # 注意：不再需要 dataset 和 tokenizer 參數
     super().__init__(config)
-    
-    # 1. 從 config 中提取模型結構參數和 token 相關參數
+    # ... (初始化代码完全不变)
     model_params = config['model_params']
     token_params = config['token_params']
-
-    # 2. 使用字典解包來創建 T5Config，更簡潔且可擴展
     t5config = T5Config(
-        **model_params,        # 解包模型結構參數
-        **token_params,        # 解包詞表、pad_id 等參數
-        decoder_start_token_id=0 # T5 通常需要這個
+        **model_params,
+        **token_params,
+        decoder_start_token_id=0
     )
-
-    # 實例化 T5 模型
     self.t5 = T5ForConditionalGeneration(config=t5config)
+    self.t5.resize_token_embeddings(config['token_params']['vocab_size'])
+    self.n_params_str = self._calculate_n_parameters() # 在初始化时计算一次
+
+  @property
+  def task_type(self) -> str:
+        return 'generative'
 
   @property
   def n_parameters(self) -> str:
-    """計算並返回模型的可訓練參數數量。"""
+    # (可以覆盖基类方法以提供更详细的参数信息)
+    return self.n_params_str
+
+  def _calculate_n_parameters(self) -> str:
     num_params = lambda ps: sum(p.numel() for p in ps if p.requires_grad)
     total_params = num_params(self.parameters())
     emb_params = num_params(self.t5.get_input_embeddings().parameters())
@@ -52,19 +50,93 @@ class TIGER(AbstractModel):
         f'# Non-embedding parameters: {total_params - emb_params:,}\n'
         f'# Total trainable parameters: {total_params:,}\n'
     )
+  
+  # --- 遵守契约 ---
 
-  def forward(self, batch: Dict[str, torch.Tensor]) -> transformers.modeling_outputs.BaseModelOutput:
-    """
-    執行標準的前向傳播（用於訓練）。
-    直接將 batch 字典解包後傳給底層的 T5 模型。
-    """
-    return self.t5(**batch)
+  def forward(self, batch: Dict) -> Dict:
+        """
+        【已修正】此版本會先從通用的 batch 中，只挑選出 T5 模型需要的參數，
+        然後再進行傳遞，以避免 TypeError。
+        """
+        # 1. 定義 T5 模型在訓練時認識的參數名稱
+        t5_known_args = {
+            'input_ids', 
+            'attention_mask', 
+            'labels'
+        }
+        
+        # 2. 建立一個只包含 T5 認識參數的新字典
+        t5_inputs = {key: value for key, value in batch.items() if key in t5_known_args}
+        
+        # 3. 將這個「乾淨」的字典傳遞給 T5 模型
+        return self.t5(**t5_inputs)
 
   def generate(self, **kwargs: Any) -> torch.Tensor:
-    """
-    執行生成（用於推斷/評估）。
-    這是 Hugging Face generate 方法的一個簡單封裝。
-    所有生成所需的參數 (如 input_ids, num_beams) 都透過 kwargs 傳入。
-    """
-    # 3. 直接將所有關鍵字參數傳給底層的 generate 方法
+    """【已实现】执行 T5 的标准生成。"""
     return self.t5.generate(**kwargs)
+
+  def evaluate_step(self, batch: Dict[str, torch.Tensor], topk_list: List[int]) -> Dict[str, float]:
+    """【已实现】封装 TIGER 专属的评估逻辑。"""
+    # 从 config 中获取评估参数
+    beam_size = self.config['evaluation_params']['beam_size']
+    code_len = self.config['code_len']
+
+    input_ids, attention_mask, labels = batch['input_ids'], batch['attention_mask'], batch['labels']
+    device = input_ids.device
+
+    # 1. 生成 (调用自身的 generate)
+    preds = self.generate(
+        input_ids=input_ids, attention_mask=attention_mask,
+        num_beams=beam_size, num_return_sequences=beam_size,
+        max_new_tokens=code_len, early_stopping=False
+    )
+    
+    # 2. 后处理
+    preds = preds[:, 1:1 + code_len].view(input_ids.shape[0], beam_size, -1)
+    
+    # 3. 计算命中 (专属逻辑)
+    pos_index = self._calculate_pos_index(preds, labels, maxk=beam_size).to(device)
+
+    # 4. 计算指标 (通用逻辑)
+    batch_metrics = {}
+    for k in topk_list:
+        recall = recall_at_k(pos_index, k).mean().item()
+        ndcg = ndcg_at_k(pos_index, k).mean().item()
+        batch_metrics[f'Recall@{k}'] = recall
+        batch_metrics[f'NDCG@{k}'] = ndcg
+          
+    return batch_metrics
+  
+  # --- TIGER 专属的内部方法 ---
+  @staticmethod
+  def _calculate_pos_index(preds: torch.Tensor, labels: torch.Tensor, maxk: int) -> torch.Tensor:
+      """
+      【已自適應】計算預測結果中哪些位置是命中的。
+      preds: (B, maxk, L)
+      labels: (B, L)
+      命中條件：前 L-1 位完全相等 && 最後一位(dup) 預測 >= 真實
+      """
+      preds = preds.detach().cpu()
+      labels = labels.detach().cpu()
+      B, _, L = preds.shape # ✅ 從輸入張量動態獲取總長度 L
+      
+      # ✅ 斷言也應該是動態的
+      assert L == labels.shape[1], f"Code length mismatch: preds have {L}, labels have {labels.shape[1]}"
+
+      pos_index = torch.zeros((B, maxk), dtype=torch.bool)
+      for i in range(B):
+          gt = labels[i]
+          # ✅ 關鍵改動：比較前 L-1 個語義層
+          gt_semantic = gt[:-1].tolist()
+          gt_dup  = int(gt[-1].item())
+
+          for j in range(maxk):
+              pj = preds[i, j]
+              # ✅ 關鍵改動：比較前 L-1 個語義層
+              pj_semantic = pj[:-1].tolist()
+              pj_dup  = int(pj[-1].item())
+
+              if pj_semantic == gt_semantic and pj_dup >= gt_dup:
+                  pos_index[i, j] = True
+                  break
+      return pos_index
