@@ -1,10 +1,3 @@
-
 export CUDA_VISIBLE_DEVICES=1
 
-python clip_feature.py \
-    --image_root ../datasets/amazon14/Images \
-    --save_root ../datasets \
-    --model_cache_dir ../cache_models/clip \
-    --dataset Baby
-
-
+python clip_feature.py --dataset Musical_Instruments --model_name_or_path /home/peiyu/PEIYU/LLM_Models/openai-mirror/clip-vit-base-patch32

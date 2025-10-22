@@ -84,7 +84,7 @@ class RKMEANS(AbstractVQ):
 
         # --- Codebooks & EMA Statistics ---
         # Codebooks are Parameters for potential gradient flow in recon_loss
-        self.codebooks = nn.Parameter(torch.empty(self.num_levels, self.codebook_size, self.code_dim))
+        self.register_buffer("codebooks", torch.empty(self.num_levels, self.codebook_size, self.code_dim)) # <-- 改成 buffer
         nn.init.xavier_uniform_(self.codebooks) # Use Xavier/Glorot initialization
         # EMA stats are buffers (non-trainable)
         self.register_buffer("cluster_sums", torch.zeros_like(self.codebooks.data))
@@ -210,7 +210,7 @@ class RKMEANS(AbstractVQ):
         new_centroids = self.cluster_sums[level] / normalized_counts
 
         # Update codebook parameter data using copy_
-        self.codebooks.data[level].copy_(new_centroids)
+        self.codebooks[level].copy_(new_centroids)
 
         # --- Reseed Near-Empty Clusters ---
         # Reseed only after some initial steps to allow counts to stabilize
