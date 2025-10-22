@@ -142,7 +142,7 @@ def main():
         choices=['ml-1m', 'ml-10m', 'ml-20m'],
         help="要下载的 MovieLens 数据集版本"
     )
-    parser.add_argument('--output_dir', type=str, default='../datasets', help="保存数据的根目录。")
+    parser.add_argument('--output_dir', type=str, default='../../datasets', help="保存数据的根目录。")
     args = parser.parse_args()
 
     dataset = args.dataset

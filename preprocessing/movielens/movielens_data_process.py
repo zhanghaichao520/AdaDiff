@@ -6,7 +6,7 @@ import random
 import torch
 from tqdm import tqdm
 import numpy as np
-from utils import check_path, clean_text, write_json_file, write_remap_index, load_json
+from ..utils import check_path, clean_text, write_json_file, write_remap_index, load_json
 
 def load_ratings(file):
     """加载评分数据"""
