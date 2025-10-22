@@ -110,33 +110,35 @@ class TIGER(AbstractModel):
   # --- TIGER 专属的内部方法 ---
   @staticmethod
   def _calculate_pos_index(preds: torch.Tensor, labels: torch.Tensor, maxk: int) -> torch.Tensor:
-      """
-      【已自適應】計算預測結果中哪些位置是命中的。
-      preds: (B, maxk, L)
-      labels: (B, L)
-      命中條件：前 L-1 位完全相等 && 最後一位(dup) 預測 >= 真實
-      """
-      preds = preds.detach().cpu()
-      labels = labels.detach().cpu()
-      B, _, L = preds.shape # ✅ 從輸入張量動態獲取總長度 L
-      
-      # ✅ 斷言也應該是動態的
-      assert L == labels.shape[1], f"Code length mismatch: preds have {L}, labels have {labels.shape[1]}"
+        """
+        【與 TIGER 共享的評估邏輯】
+        假設 code 總是包含 L-1 個語義層和最後 1 個重複層。
+        """
+        preds = preds.detach().cpu()
+        labels = labels.detach().cpu()
+        B, _, L_pred = preds.shape
+        L_label = labels.shape[1]
 
-      pos_index = torch.zeros((B, maxk), dtype=torch.bool)
-      for i in range(B):
-          gt = labels[i]
-          # ✅ 關鍵改動：比較前 L-1 個語義層
-          gt_semantic = gt[:-1].tolist()
-          gt_dup  = int(gt[-1].item())
+        # 如果生成長度不足（例如提前遇到 EOS），用 padding 補齊
+        if L_pred < L_label:
+            padding = torch.zeros((B, maxk, L_label - L_pred), dtype=preds.dtype)
+            preds = torch.cat([preds, padding], dim=2)
+        # 如果生成長度過長，截斷
+        elif L_pred > L_label:
+            preds = preds[:, :, :L_label]
+        
+        pos_index = torch.zeros((B, maxk), dtype=torch.bool)
+        for i in range(B):
+            gt = labels[i]
+            gt_semantic = gt[:-1].tolist()
+            gt_dup  = int(gt[-1].item())
 
-          for j in range(maxk):
-              pj = preds[i, j]
-              # ✅ 關鍵改動：比較前 L-1 個語義層
-              pj_semantic = pj[:-1].tolist()
-              pj_dup  = int(pj[-1].item())
+            for j in range(maxk):
+                pj = preds[i, j]
+                pj_semantic = pj[:-1].tolist()
+                pj_dup  = int(pj[-1].item())
 
-              if pj_semantic == gt_semantic and pj_dup >= gt_dup:
-                  pos_index[i, j] = True
-                  break
-      return pos_index
+                if pj_semantic == gt_semantic and pj_dup == gt_dup:
+                    pos_index[i, j] = True
+                    break
+        return pos_index

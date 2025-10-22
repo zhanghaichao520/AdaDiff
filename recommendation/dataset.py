@@ -9,10 +9,14 @@ import os
 # 通用工具
 # -----------------------------
 def pad_or_truncate(sequence, max_len, PAD_TOKEN=0):
-    """对 itemID 序列做左侧 pad 或右侧截断"""
+    """
+    对 itemID 序列做【左侧 pad】或【左侧截断】
+    """
     if len(sequence) > max_len:
+        # 序列過長：保留最後的 max_len 個 item (左侧截断)
         return sequence[-max_len:]
     else:
+        # ✅ 關鍵：必須使用「左側填充」，以配合 GPT-2 的 Tokenizer
         return [PAD_TOKEN] * (max_len - len(sequence)) + sequence
 
 def item2code(code_path, vocab_sizes, bases):

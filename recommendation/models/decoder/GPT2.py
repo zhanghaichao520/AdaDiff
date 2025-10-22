@@ -177,7 +177,7 @@ class GPT2(AbstractModel):
                 pj_semantic = pj[:-1].tolist()
                 pj_dup  = int(pj[-1].item())
 
-                if pj_semantic == gt_semantic and pj_dup >= gt_dup:
+                if pj_semantic == gt_semantic and pj_dup == gt_dup:
                     pos_index[i, j] = True
                     break
         return pos_index
