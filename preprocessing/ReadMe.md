@@ -101,6 +101,12 @@ python generate_embeddings/image_embedding.py \
   --model_name_or_path /home/peiyu/PEIYU/LLM_Models/openai-mirror/clip-vit-base-patch32
 ```
 
+### 协同特征
+
+```bash
+python generate_embeddings/cf_embedding.py --dataset Musical_Instruments --epochs 50 --hidden_dim 512
+```
+
 ---
 
 ## 🔗 5. 多模态融合 (文本 + 视觉)

@@ -1,5 +1,3 @@
-# 檔案路徑: configs/RPG.yaml
-
 # RPG 模型獨有的架構參數
 model_params:
   max_len: 50
@@ -8,18 +6,22 @@ model_params:
   n_head: 4
   n_inner: 1024
   activation_function: gelu_new
-  resid_pdrop: 0.0
-  embd_pdrop: 0.5
-  attn_pdrop: 0.5
+  # --- 关键修正 1: 降低 Dropout ---
+  resid_pdrop: 0.1
+  embd_pdrop: 0.1
+  attn_pdrop: 0.1
+  # ---
   layer_norm_epsilon: 1e-12
   initializer_range: 0.02
   temperature: 0.07
 
 # ✨ 範例：如果 RPG 需要不同的 batch size，可以在這裡覆蓋 base.yaml
 training_params:
-  batch_size: 512
-  lr: 0.01
-  early_stop: 20
+  batch_size: 1024
+  # --- 关键修正 2: 提高学习率 ---
+  lr: 0.0001  # (从 1e-5 提高到 1e-4)
+  # ---
+  early_stop: 15
 
 evaluation_params:
-  batch_size: 512 # 評估時的 batch size
+  batch_size: 512
