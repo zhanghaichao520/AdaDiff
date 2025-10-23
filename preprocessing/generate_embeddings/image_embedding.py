@@ -8,7 +8,14 @@ import numpy as np
 # 导入 Hugging Face 的 CLIP 相关库
 from transformers import CLIPProcessor, CLIPModel
 
-# 不再需要 OpenAI 的 clip 包
+# 假设 utils.py 在上一级目录
+try:
+    import sys
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from utils import load_json, clean_text, set_device
+except ImportError:
+    print("警告: 无法自动导入 utils.py。")
+
 
 def load_json(file):
     # (保持不变)
@@ -40,10 +47,9 @@ def get_id2item_dict(item2id_file):
             continue 
     return id2item
 
-# --- BACKBONE_MAP 不再需要 ---
 
 def get_feature(args):
-    # --- 修改：打印信息使用 model_name_or_path ---
+    # --- 1. 打印信息 ---
     print(f"开始处理: Dataset={args.dataset}, Version={args.data_version}, Model={args.model_name_or_path}")
 
     # --- 路径构建 (保持不变) ---
@@ -70,7 +76,6 @@ def get_feature(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f'使用设备: {device}')
     
-    # --- 关键修改：直接使用 args.model_name_or_path ---
     print(f'加载 Hugging Face CLIP 模型: {args.model_name_or_path} ...')
     try:
         processor = CLIPProcessor.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
@@ -116,11 +121,11 @@ def get_feature(args):
                     break 
 
                 except UnidentifiedImageError:
-                     print(f"\n无法识别的图片文件格式: {image_file}")
+                     # print(f"\n无法识别的图片文件格式: {image_file}")
                      continue 
                 except Exception as e:
-                    print(f"\n处理图片时发生错误: {e}")
-                    print(f"文件路径: {image_file}")
+                    # print(f"\n处理图片时发生错误: {e}")
+                    # print(f"文件路径: {image_file}")
                     image_feature = torch.zeros(embedding_dim) 
                     continue 
             
@@ -134,14 +139,25 @@ def get_feature(args):
     embeddings = torch.stack(embeddings, dim=0).numpy()
     print('Embeddings shape: ', embeddings.shape)
 
-    # --- 关键修改：文件名使用 model_name_or_path ---
-    # 将路径中的 / 替换为 - 以创建有效的文件名
-    hf_model_tag = args.model_name_or_path.replace('/', '-')
+    # =================================================================
+    # ========== 这里是关键修改：统一命名规则 ==========
+    # =================================================================
+    # 旧规则: hf_model_tag = args.model_name_or_path.replace('/', '-') 
+    #   (e.g., 'openai-clip-vit-base-patch32')
+    
+    # 新规则 (与 text 脚本一致):
+    hf_model_tag = args.model_name_or_path.split('/')[-1]
+    #   (e.g., 'clip-vit-base-patch32')
+    
+    # (保险起见，再次替换，以防模型名称本身包含斜杠)
+    hf_model_tag = hf_model_tag.replace('/', '-')
     
     save_dir = os.path.join(processed_data_path, "embeddings")
     os.makedirs(save_dir, exist_ok=True)
     
+    # 新的文件名:
     save_file = os.path.join(save_dir, f'{args.dataset}.emb-image-{hf_model_tag}.npy')
+    # =================================================================
     
     print(f"正在保存特征到: {save_file}")
     try:
@@ -156,10 +172,8 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='Home', help='例如 Baby, All_Beauty, Home 等')
     parser.add_argument('--image_root', type=str, default="../datasets", help='包含 amazon14/ 和 amazon18/ 的根目录')
     parser.add_argument('--save_root', type=str, default="../datasets", help='预处理后数据的根目录')
-    # --- 关键修改：用 model_name_or_path 替换 backbone ---
-    # 移除了 --backbone 参数
     parser.add_argument('--model_name_or_path', type=str, default='openai/clip-vit-base-patch32', help='Hugging Face Hub 上的 CLIP 模型 ID 或本地路径')
-    parser.add_argument('--model_cache_dir', type=str, default='./hf_clip_cache', help='Hugging Face 模型下载缓存目录')
+    parser.add_argument('--model_cache_dir', type=str, default=None, help='Hugging Face 模型下载缓存目录 (默认为 None, 使用 HF 默认缓存)')
     return parser.parse_args()
     
 if __name__ == "__main__":

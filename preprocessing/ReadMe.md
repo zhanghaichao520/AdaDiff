@@ -1,24 +1,166 @@
-### 主要改動說明
+# 🧩 GenRec-Factory 数据处理与Embedding
 
-1.  **合併輔助函數**: `download_file`, `extract_zip_file`, `extract_ratings_from_reviews` (稍微改名以區分 Amazon) 被移到腳本頂部。
-2.  **`process_amazon` 函數**: 封裝了原 `download_amazon.py` 的主要邏輯，接收 `dataset_name` (即 category), `data_version`, `output_dir` 作為參數。
-3.  **`process_movielens` 函數**: 封裝了原 `download_movielens.py` 的主要邏輯，接收 `dataset_name`, `output_dir` 作為參數。內部包含了 URL 映射、解壓和格式轉換的邏輯。**注意**: MovieLens 的數據處理部分（格式轉換為 CSV 和 JSON）也被合併進來了，因為它緊跟著下載和解壓。
-4.  **`main` 函數**:
-    * 使用 `argparse` 接收 `--source`, `--dataset`, `--data_version`, `--output_dir` 參數。
-    * 根據 `--source` 的值，調用 `process_amazon` 或 `process_movielens`，並傳遞相應的參數。
-    * 為 MovieLens 添加了 `--dataset` 值的驗證。
-5.  **路徑結構**:
-    * Amazon 數據仍然遵循 `../datasets/amazon{version}/Metadata/`, `../datasets/amazon{version}/Review/`, `../datasets/amazon{version}/Ratings/` 的結構。
-    * MovieLens 數據現在會保存在 `../datasets/{dataset_name}/raw/` (原始解壓文件) 和 `../datasets/{dataset_name}/processed/` (處理後的 CSV 和 JSON)。
+本项目提供从 **原始数据下载 → 数据预处理 → 文本与图像 Embedding 生成 → 多模态融合** 的一站式处理脚本。  
+以 Amazon 与 MovieLens 为例。
 
-### 如何使用
+
+## 📦 1. 下载数据集
+
+从公开源下载 Amazon 或 MovieLens 数据集：
 
 ```bash
-# 下載並處理 Amazon Musical_Instruments (v14)
+# Amazon 数据集
 python download_data.py --source amazon --dataset Baby
 
-# 下載並處理 MovieLens 1M
+# MovieLens 数据集
 python download_data.py --source movielens --dataset ml-1m
+```
 
-# 下載並處理 MovieLens 20M
-python download_data.py --source movielens --dataset ml-20m
+
+## 🖼️ 2. 下载图片资源
+
+若数据包含图像内容，可运行以下命令下载对应图片：
+
+```bash
+# Amazon 类数据集
+python download_images.py --dataset_type amazon --dataset Musical_Instruments
+
+# MovieLens 数据集
+python download_images.py --dataset_type movielens --dataset ml-1m
+```
+
+
+
+## 🧹 3. 数据预处理
+
+对原始数据执行清洗、格式化与标准化：
+
+```bash
+# Amazon
+python process_data.py --dataset_type amazon --dataset Musical_Instruments
+
+# MovieLens
+python process_data.py --dataset_type movielens --dataset ml-1m
+```
+
+---
+
+## 🔠 4. Embedding 生成
+
+### 📘 文本特征
+
+#### （1）使用本地模型
+
+```bash
+python generate_embeddings/text_embeddings.py \
+  --dataset_type amazon \
+  --mode local \
+  --dataset Musical_Instruments \
+  --model_name_or_path /home/peiyu/PEIYU/LLM_Models/Qwen/Qwen3-Embedding-8B \
+  --batch_size 128 \
+  --pca_dim 512
+```
+
+#### （2）使用 API 模型
+
+```bash
+python generate_embeddings/text_embeddings.py \
+  --dataset_type amazon \
+  --mode api \
+  --dataset Musical_Instruments \
+  --sent_emb_model text-embedding-3-large \
+  --openai_api_key sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --openai_base_url https://yunwu.ai/v1 \
+  --batch_size 256 \
+  --pca_dim 512
+```
+
+同样适用于 MovieLens：
+
+```bash
+python generate_embeddings/text_embeddings.py \
+  --dataset_type movielens \
+  --mode api \
+  --dataset ml-1m \
+  --sent_emb_model text-embedding-3-large \
+  --openai_api_key sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --openai_base_url https://yunwu.ai/v1 \
+  --batch_size 256 \
+  --pca_dim 512
+```
+
+---
+
+### 🖼️ 图像特征
+
+使用 CLIP 模型提取视觉 Embedding：
+
+```bash
+python generate_embeddings/image_embedding.py \
+  --dataset Musical_Instruments \
+  --model_name_or_path /home/peiyu/PEIYU/LLM_Models/openai-mirror/clip-vit-base-patch32
+```
+
+---
+
+## 🔗 5. 多模态融合 (文本 + 视觉)
+
+将文本与图像 Embedding 融合，生成最终的多模态表示：
+
+```bash
+python generate_embeddings/fuse_embedding.py \
+  --dataset Musical_Instruments \
+  --text_model_tag "text-embedding-3-large" \
+  --image_model_tag "clip-vit-base-patch32"
+```
+
+融合结果将保存至：
+
+```
+data/Musical_Instruments/embeddings/fused_emb.npy
+```
+
+---
+
+## 📁 输出结构说明
+
+处理完毕后，文件目录一般如下：
+
+```
+data/
+├── Musical_Instruments/
+│   ├── raw/                     # 原始数据
+│   ├── processed/               # 清洗后的数据
+│   ├── images/                  # 下载的图像
+│   ├── embeddings/
+│   │   ├── text_emb.npy         # 文本 embedding
+│   │   ├── image_emb.npy        # 图像 embedding
+│   │   └── fused_emb.npy        # 多模态融合 embedding
+│   └── meta.json                # 元数据
+└── ml-1m/
+    ├── ...
+```
+
+---
+
+## 🧠 提示
+
+* 若使用本地模型，请确保路径正确且 GPU 可用；
+* 若使用 API 模式，请提前配置好 `--openai_api_key` 与代理地址；
+* 若希望加速 PCA，可使用 `--pca_dim 512` 参数压缩维度。
+
+---
+
+## 📜 作者与引用
+
+本流程改编自 **GenRec-Factory** 预处理模块，适用于多模态生成式推荐数据准备阶段。
+
+```
+
+---
+
+是否希望我帮你在这个 README 中再补上一个「🧩 接下来的步骤」章节，比如：
+- 如何输入到 RQ-VAE；
+- 如何生成 codebook；
+- 如何将 embedding 转成 token（用于 MMGRec / TIGER）？
+```

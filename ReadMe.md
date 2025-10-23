@@ -27,14 +27,14 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 | Dataset | Implemented |
 |--------------------|--------------|
 | Amazon | ✅ |
+| Movie Lens| ✅ |
 
 ## 💬 Embedding Extraction
 | Category | Component / Method | Done |
 |-----------|--------------------|--------------|
-| 🧠 Textual | Sentence Embedding | ✅ |
+| 🧠 Textual | Local Embedding (Qwen, T5) | ✅ |
 |  | OpenAI Embedding API | ✅ |
-|  | Local LLM Embedding (Qwen2.5, MiniCPM) | ✅ |
-| 🖼️ Visual | CLIP / BLIP2 Encoder | ✅ |
+| 🖼️ Visual | CLIP Encoder | ✅ |
 |  | Multimodal Fusion | ✅ |
 | 👥 Collaborative | SASRec Sequence Embedding | ✅ |
 | 🧩 Management | PCA Compression & Storage | ✅ |
@@ -74,7 +74,7 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 |---------------|------------|-----------|------------------------|-----------|-----------|
 | **Encoder-Decoder** | TIGER | [Recommender Systems with Generative Retrieval](https://arxiv.org/pdf/2305.05065) | NIPS' 23 | rqvae.py + TIGER.py | ✅ |
 | **Encoder-Retrieval** | RPG | [Generating Long Semantic IDs in Parallel for Recommendation](http://arxiv.org/abs/2506.05781) | KDD' 25 | opq.py + RPG.py | ✅ | 
-| **Quantization** | LETTER | [Learnable Item Tokenization for Generative Recommendation](https://dl.acm.org/doi/10.1145/3627673.3679569) | CIKM' 24 | opq.py + RPG.py | - |
+| **Quantization** | LETTER | [Learnable Item Tokenization for Generative Recommendation](https://dl.acm.org/doi/10.1145/3627673.3679569) | CIKM' 24 | rqvae_letter.py + TIGER.py | ✅ |
 
 
 

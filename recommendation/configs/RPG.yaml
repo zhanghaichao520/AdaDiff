@@ -17,7 +17,7 @@ model_params:
 
 # ✨ 範例：如果 RPG 需要不同的 batch size，可以在這裡覆蓋 base.yaml
 training_params:
-  batch_size: 256
+  batch_size: 512
   lr: 0.01
   early_stop: 20
 
