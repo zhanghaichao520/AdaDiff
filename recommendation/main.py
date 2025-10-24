@@ -18,7 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description="GenRec Universal Training Pipeline")
     parser.add_argument('--model', type=str, required=True, help='模型名稱 (e.g., TIGER, GPT2, RPG)')
     parser.add_argument('--dataset', type=str, required=True, help='数据集名稱 (e.g., Beauty)')
-    parser.add_argument('--quant_method', type=str, required=True, choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq', 'rqvae_letter'],
+    parser.add_argument('--quant_method', type=str, required=True, choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq'],
                         help='量化方法')
     args = parser.parse_args()
 
@@ -103,53 +103,74 @@ def main():
         **loader_kwargs
     )
 
-    # === 9. 訓練-評估循環 ===
+    # === 9. 训练-评估循环 (已修改) ===
     best_ndcg = 0.0
     early_stop_counter = 0
     best_epoch = 0
     best_val_results = None
     best_test_results = None
+    
+    # 从配置中获取评估间隔
+    eval_interval = config['training_params'].get('eval_interval', 1) # 默认为 1 (慢速模式)
+    logging.info(f"Evaluation interval set to: {eval_interval} epoch(s)")
 
     for epoch in range(config['training_params']['num_epochs']):
-        logging.info(f"--- Epoch {epoch + 1}/{config['training_params']['num_epochs']} ---")
+        epoch_num = epoch + 1 # 当前 epoch 编号 (从 1 开始)
+        logging.info(f"--- Epoch {epoch_num}/{config['training_params']['num_epochs']} ---")
+        
+        # --- 训练 ---
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
         logging.info(f"Training loss: {train_loss:.4f}")
 
-        val_results = evaluate(
-            model,
-            validation_loader,
-            config['evaluation_params']['topk_list'],
-            device
-        )
-        logging.info(f"Validation Results: {val_results}")
-
-        current_ndcg = val_results.get('NDCG@10', val_results.get('NDCG@20', 0.0))
-
-        if current_ndcg > best_ndcg:
-            best_ndcg = current_ndcg
-            early_stop_counter = 0
-            logging.info(f"🚀 New best NDCG on validation: {best_ndcg:.4f}")
-
-            test_results = evaluate(
+        # --- 评估 (根据 eval_interval) ---
+        # 检查是否到达评估的 epoch
+        if epoch_num % eval_interval == 0:
+            logging.info(f"--- Evaluating at Epoch {epoch_num} ---")
+            val_results = evaluate(
                 model,
-                test_loader,
+                validation_loader,
                 config['evaluation_params']['topk_list'],
                 device
             )
-            logging.info(f"Test Results: {test_results}")
+            logging.info(f"Validation Results: {val_results}")
 
-            best_epoch = epoch + 1
-            best_val_results = val_results
-            best_test_results = test_results
+            current_ndcg = val_results.get('NDCG@10', val_results.get('NDCG@20', 0.0))
 
-            torch.save(model.state_dict(), config['save_path'])
-            logging.info(f"Best model saved to {config['save_path']}")
+            # --- 检查性能提升和 Early Stopping ---
+            if current_ndcg > best_ndcg:
+                best_ndcg = current_ndcg
+                early_stop_counter = 0 # 重置计数器
+                logging.info(f"🚀 New best NDCG on validation: {best_ndcg:.4f} at Epoch {epoch_num}")
+
+                # --- 只有在验证集性能提升时，才评估测试集 ---
+                test_results = evaluate(
+                    model,
+                    test_loader,
+                    config['evaluation_params']['topk_list'],
+                    device
+                )
+                logging.info(f"Test Results: {test_results}")
+
+                # 更新最佳结果记录
+                best_epoch = epoch_num
+                best_val_results = val_results
+                best_test_results = test_results
+
+                # 保存最佳模型
+                torch.save(model.state_dict(), config['save_path'])
+                logging.info(f"Best model saved to {config['save_path']}")
+            
+            else:
+                # 验证集性能没有提升
+                early_stop_counter += eval_interval # <--- 注意：每次检查时增加 interval 的值
+                logging.info(f"No improvement since Epoch {best_epoch}. Early stop counter: {early_stop_counter}/{config['training_params']['early_stop'] * eval_interval}")
+                # <--- 修改 Early Stopping 条件：当累计未提升的 epoch 数（考虑了 interval）超过阈值时停止
+                if early_stop_counter >= config['training_params']['early_stop'] * eval_interval:
+                    logging.info("Early stopping triggered.")
+                    break
         else:
-            early_stop_counter += 1
-            logging.info(f"No improvement. Early stop counter: {early_stop_counter}/{config['training_params']['early_stop']}")
-            if early_stop_counter >= config['training_params']['early_stop']:
-                logging.info("Early stopping triggered.")
-                break
+             # 如果不是评估 epoch，只打印训练损失信息
+             logging.info(f"Skipping evaluation for Epoch {epoch_num}.")
 
     # === 10. 訓練結束總結 ===
     logging.info("="*50)

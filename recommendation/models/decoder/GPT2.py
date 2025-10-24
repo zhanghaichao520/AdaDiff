@@ -103,18 +103,21 @@ class GPT2(AbstractModel):
 
     def evaluate_step(self, batch: Dict[str, torch.Tensor], topk_list: List[int]) -> Dict[str, float]:
         """
-        評估邏輯與 TIGER 非常相似，但需要處理 GPT-2 generate 的輸出格式。
+        【已修正】此版本返回指标的总和 (sum) 和批次大小 ('count')，
+        以配合 trainer.py 中的正确平均值计算。
         """
         beam_size = self.config['evaluation_params']['beam_size']
         code_len = self.config['code_len']
 
-        # 準備 generation 的輸入，只需要 history
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
-        labels = batch['labels']
+        labels = batch['labels'] # (B, L_target) - Target Codes
         device = input_ids.device
+        
+        # ✅ 获取真实的批次大小
+        batch_size = labels.shape[0] 
 
-        # 1. 生成
+        # 1. 生成 (不变)
         preds = self.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -126,25 +129,30 @@ class GPT2(AbstractModel):
             eos_token_id=self.config['token_params']['eos_token_id']
         )
         
-        # 2. 後處理
-        # GPT-2 的輸出包含了輸入的 prompt (history_ids)，我們需要把它切掉
-        # preds shape: (B * beam_size, L_hist_flat + L_target)
+        # 2. 后处理 (不变)
         generated_part = preds[:, input_ids.shape[1]:]
-        # Reshape to (B, beam_size, L_target)
-        preds_reshaped = generated_part.view(input_ids.shape[0], beam_size, -1)
+        preds_reshaped = generated_part.view(batch_size, beam_size, -1)
         
-        # 3. 計算命中 (與 TIGER 完全相同的邏輯)
+        # 3. 计算命中 (不变)
         pos_index = self._calculate_pos_index(preds_reshaped, labels, maxk=beam_size)
-        pos_index = pos_index.to(device)
+        # pos_index 不需要移动到 device，因为它是在 CPU 上计算并用于后续 CPU 计算的
         
-        # 4. 計算指標
+        # 4. 计算指标总和
         batch_metrics = {}
         for k in topk_list:
-            recall = recall_at_k(pos_index, k).mean().item()
-            ndcg = ndcg_at_k(pos_index, k).mean().item()
-            batch_metrics[f'Recall@{k}'] = recall
-            batch_metrics[f'NDCG@{k}'] = ndcg
+            # ✅ 计算批次内的总和 (sum)，而不是平均值 (mean)
+            # 注意：pos_index 已经是 CPU tensor
+            recall_sum = recall_at_k(pos_index, k).sum().item() 
+            ndcg_sum = ndcg_at_k(pos_index, k).sum().item()
+            
+            # 存储总和
+            batch_metrics[f'Recall@{k}'] = recall_sum 
+            batch_metrics[f'NDCG@{k}'] = ndcg_sum
+            
+        # ✅ 5. 添加批次大小 'count'
+        batch_metrics['count'] = float(batch_size) 
           
+        # 返回包含 count 和 指标总和 的字典
         return batch_metrics
   
     @staticmethod

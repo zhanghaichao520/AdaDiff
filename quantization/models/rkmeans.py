@@ -167,6 +167,9 @@ class RKMEANS(AbstractVQ):
     def _layer_init_if_needed(self, residual: torch.Tensor):
         """ Initialize the current layer using KMeans++ if buffer is full. """
         l = self.current_level
+        if l >= self.num_levels:
+            # self.logger.debug(f"_layer_init_if_needed called with l={l}, but num_levels={self.num_levels}. Returning.") # 可选的调试日志
+            return
         # Skip if already initialized or training is finished
         if self.initialized_levels[l] or l >= self.num_levels: return
         # Collect data into buffer
@@ -272,12 +275,12 @@ class RKMEANS(AbstractVQ):
             if self.training and self.train_layer_wise and l == self.current_level:
                 # Pass residual detached, init doesn't need grads
                 self._layer_init_if_needed(current_residual.detach())
-
+            
             # Skip quantization if layer is not initialized
-            if not self.initialized_levels[l]:
+            if l >= self.num_levels or not self.initialized_levels[l]:
                  # If training, still collect buffer for the layer to be initialized
-                 if self.training and self.train_layer_wise and l == self.current_level:
-                     self._maybe_collect_init(current_residual.detach())
+                #  if self.training and self.train_layer_wise and l == self.current_level:
+                #      self._maybe_collect_init(current_residual.detach())
                  continue # Move to next layer
 
             # --- Quantization Step ---

@@ -76,13 +76,20 @@ class TIGER(AbstractModel):
     return self.t5.generate(**kwargs)
 
   def evaluate_step(self, batch: Dict[str, torch.Tensor], topk_list: List[int]) -> Dict[str, float]:
-    """【已实现】封装 TIGER 专属的评估逻辑。"""
+    """
+    【已修正】封装 TIGER 专属的评估逻辑。
+    - 此版本现在返回指标的 *总和 (Sum)* 和 *批次大小 (Count)*
+    - 这将配合 trainer.py 中修正后的聚合逻辑。
+    """
     # 从 config 中获取评估参数
     beam_size = self.config['evaluation_params']['beam_size']
     code_len = self.config['code_len']
 
     input_ids, attention_mask, labels = batch['input_ids'], batch['attention_mask'], batch['labels']
     device = input_ids.device
+    
+    # ✅ 1. 获取批次大小
+    batch_size = input_ids.shape[0]
 
     # 1. 生成 (调用自身的 generate)
     preds = self.generate(
@@ -92,18 +99,24 @@ class TIGER(AbstractModel):
     )
     
     # 2. 后处理
-    preds = preds[:, 1:1 + code_len].view(input_ids.shape[0], beam_size, -1)
+    preds = preds[:, 1:1 + code_len].view(batch_size, beam_size, -1)
     
     # 3. 计算命中 (专属逻辑)
     pos_index = self._calculate_pos_index(preds, labels, maxk=beam_size).to(device)
 
     # 4. 计算指标 (通用逻辑)
     batch_metrics = {}
+    
+    # ✅ 2. 将 'count' 添加到返回的字典中
+    batch_metrics['count'] = batch_size
+    
     for k in topk_list:
-        recall = recall_at_k(pos_index, k).mean().item()
-        ndcg = ndcg_at_k(pos_index, k).mean().item()
-        batch_metrics[f'Recall@{k}'] = recall
-        batch_metrics[f'NDCG@{k}'] = ndcg
+        # ✅ 3. 计算 .sum() 而不是 .mean()
+        recall_sum = recall_at_k(pos_index, k).sum().item()
+        ndcg_sum = ndcg_at_k(pos_index, k).sum().item()
+        
+        batch_metrics[f'Recall@{k}'] = recall_sum
+        batch_metrics[f'NDCG@{k}'] = ndcg_sum
           
     return batch_metrics
   

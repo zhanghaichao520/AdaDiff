@@ -206,98 +206,21 @@ class RPG(AbstractModel):
 
     # --- _generate_ranklist 和 evaluate_step 保持不變 (它們只用最後狀態) ---
     def _generate_ranklist(self, batch: Dict, topk: int) -> torch.Tensor:
-        """
-        [已修正] 使用与训练目标一致的 "sum of log-probabilities" 逻辑进行推理。
-        """
-        input_item_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        batch_size = input_item_ids.shape[0]
+        input_item_ids = batch['input_ids']; attention_mask = batch['attention_mask']; batch_size = input_item_ids.shape[0]
         current_device = input_item_ids.device
         self._ensure_item_id2tokens_on_device(current_device)
-
-        # --- 1. 获取最后一个时间步的 Head 输出 ---
-        # (这部分和你的 v4 评估逻辑相同)
-        input_tokens = self.item_id2tokens[input_item_ids]
-        token_embs = self.gpt2.wte(input_tokens)
-        input_embs = token_embs.mean(dim=2)
+        input_tokens = self.item_id2tokens[input_item_ids]; token_embs = self.gpt2.wte(input_tokens); input_embs = token_embs.mean(dim=2)
         outputs = self.gpt2(inputs_embeds=input_embs, attention_mask=attention_mask)
-        
-        seq_lens = attention_mask.sum(dim=1)
-        valid_lens = torch.clamp(seq_lens - 1, min=0)
+        seq_lens = attention_mask.sum(dim=1); valid_lens = torch.clamp(seq_lens - 1, min=0)
         max_seq_len_in_batch = outputs.last_hidden_state.shape[1]
         valid_lens = torch.min(valid_lens, torch.tensor(max_seq_len_in_batch - 1, device=current_device))
-        
-        last_hidden_states = outputs.last_hidden_state[torch.arange(batch_size, device=current_device), valid_lens] # (B, D)
-        
-        # 应用 Heads
-        final_states = [head(last_hidden_states) for head in self.pred_heads]
-        final_states = torch.stack(final_states, dim=1) # (B, L_code, D)
-        final_states = F.normalize(final_states, dim=-1)
-
-        # --- 2. [修正] 像训练时一样，计算 per-codebook logits ---
-        token_emb = self.gpt2.wte.weight
-        token_emb_norm = F.normalize(token_emb, dim=-1)
-        bases = torch.tensor(self.config['bases'], device=current_device)
-        vocab_sizes = torch.tensor(self.config['vocab_sizes'], device=current_device)
-
-        # (和 forward 中一样的 chunk 逻辑)
-        all_same_size = all(vs == vocab_sizes[0] for vs in vocab_sizes)
-        use_chunk = False
-        if all_same_size and len(vocab_sizes) == self.n_pred_head:
-            codebook_size_k = vocab_sizes[0].item(); start_idx = 1
-            max_valid_code_token_id = bases[-1] + vocab_sizes[-1]; end_idx = min(start_idx + self.n_pred_head * codebook_size_k, token_emb.shape[0])
-            usable_token_embs = token_emb_norm[start_idx : end_idx]
-            if usable_token_embs.shape[0] == self.n_pred_head * codebook_size_k:
-                token_embs_chunks = torch.chunk(usable_token_embs, self.n_pred_head, dim=0); use_chunk = True
-
-        all_code_logits = []
-        for i in range(self.n_pred_head):
-            if use_chunk: token_embs_i = token_embs_chunks[i] # (K, D)
-            else: start_idx = bases[i] + 1; end_idx = min(start_idx + vocab_sizes[i], token_emb.shape[0]); token_embs_i = token_emb_norm[start_idx:end_idx] # (K, D)
-            
-            user_repr_i = final_states[:, i, :] # (B, D)
-            logits_i = torch.matmul(user_repr_i, token_embs_i.T) / self.temperature # (B, K)
-            
-            # 使用 log_softmax，这与 CrossEntropyLoss 的内部计算一致
-            log_probs_i = F.log_softmax(logits_i, dim=-1) # (B, K)
-            all_code_logits.append(log_probs_i)
-
-        # --- 3. [修正] Gather 得到每个 item 的分数 ---
-        
-        # (N_items, L_code)，注意我们只使用 1-based item IDs
-        # (官方代码 item_id2tokens[1:,:] 假设 0 是 padding)
-        all_item_codes = self.item_id2tokens[1:] # (N_items-1, L_code)
-        
-        # 转换为 0-based (相对于 codebook)
-        all_item_codes_0based = all_item_codes - bases - 1 # (N_items-1, L_code)
-
-        item_scores = torch.zeros((batch_size, self.n_items - 1), device=current_device)
-        
-        for i in range(self.n_pred_head):
-            # 获取第 i 个 codebook 的 log_probs (B, K)
-            log_probs_i = all_code_logits[i]
-            
-            # 获取所有 item 的第 i 个 code (N_items-1,)
-            item_codes_i = all_item_codes_0based[:, i] # (N_items-1,)
-            
-            # 从 (B, K) 中为所有 item 收集分数
-            # (B, 1, K) gather (B, N_items-1, 1) -> (B, N_items-1, 1)
-            # 我们需要 (B, K) gather (N_items-1,) -> (B, N_items-1)
-            item_scores_i = torch.gather(
-                log_probs_i, # (B, K)
-                dim=1,
-                index=item_codes_i.unsqueeze(0).expand(batch_size, -1) # (B, N_items-1)
-            )
-            item_scores += item_scores_i # 累加 log-probabilities
-
-        # --- 4. 获取 Top-K ---
-        # item_scores (B, N_items-1)
-        _, topk_indices_0based = torch.topk(item_scores, k=topk, dim=1)
-        
-        # 将 0-based (相对于 N_items-1) 转换回 1-based (原始 Item ID)
-        topk_indices_1based = topk_indices_0based + 1
-        
-        return topk_indices_1based # 1-based IDs
+        last_hidden_states = outputs.last_hidden_state[torch.arange(batch_size, device=current_device), valid_lens]
+        final_states = [head(last_hidden_states) for head in self.pred_heads]; final_states = torch.stack(final_states, dim=1); final_states = F.normalize(final_states, dim=-1)
+        token_emb = self.gpt2.wte.weight; token_emb_norm = F.normalize(token_emb, dim=-1)
+        all_item_embs = self.gpt2.wte(self.item_id2tokens); all_item_embs = F.normalize(all_item_embs, dim=-1)
+        item_scores = torch.einsum('bld,ild->bi', final_states, all_item_embs)
+        _, topk_indices = torch.topk(item_scores, k=topk, dim=1)
+        return topk_indices # 1-based IDs
 
     def evaluate_step(self, batch: Dict, topk_list: List[int]) -> Dict[str, float]:
         max_k = max(topk_list)

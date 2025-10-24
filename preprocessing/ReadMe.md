@@ -10,7 +10,7 @@
 
 ```bash
 # Amazon 数据集
-python download_data.py --source amazon --dataset Baby
+python download_data.py --source amazon --dataset Toys_and_Games
 
 # MovieLens 数据集
 python download_data.py --source movielens --dataset ml-1m
@@ -37,7 +37,7 @@ python download_images.py --dataset_type movielens --dataset ml-1m
 
 ```bash
 # Amazon
-python process_data.py --dataset_type amazon --dataset Musical_Instruments
+python process_data.py --dataset_type amazon --dataset Toys_and_Games
 
 # MovieLens
 python process_data.py --dataset_type movielens --dataset ml-1m
@@ -52,10 +52,10 @@ python process_data.py --dataset_type movielens --dataset ml-1m
 #### （1）使用本地模型
 
 ```bash
-python generate_embeddings/text_embeddings.py \
+python generate_embeddings/text_embedding.py \
   --dataset_type amazon \
   --mode local \
-  --dataset Musical_Instruments \
+  --dataset Toys_and_Games \
   --model_name_or_path /home/peiyu/PEIYU/LLM_Models/Qwen/Qwen3-Embedding-8B \
   --batch_size 128 \
   --pca_dim 512
@@ -64,12 +64,12 @@ python generate_embeddings/text_embeddings.py \
 #### （2）使用 API 模型
 
 ```bash
-python generate_embeddings/text_embeddings.py \
+python generate_embeddings/text_embedding.py \
   --dataset_type amazon \
   --mode api \
-  --dataset Musical_Instruments \
+  --dataset Toys_and_Games \
   --sent_emb_model text-embedding-3-large \
-  --openai_api_key sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --openai_api_key sk-492a02uVsAauNrYsP4YRW2pvAsELc20hoHJeUh2Sop3GiL3C \
   --openai_base_url https://yunwu.ai/v1 \
   --batch_size 256 \
   --pca_dim 512
