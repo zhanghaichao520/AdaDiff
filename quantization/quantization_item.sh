@@ -1,5 +1,5 @@
 python main.py \
-  --model_name rkmeans \
+  --model_name opq \
   --dataset_name Toys_and_Games \
   --embedding_modality text \
   --embedding_model text-embedding-3-large

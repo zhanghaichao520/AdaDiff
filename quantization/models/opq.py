@@ -1,4 +1,4 @@
-# 檔案路徑: tokenlization_stage/models/opq.py
+# 文件路徑: /quantization/models/opq.py (仅修改此文件版本)
 
 import torch
 from torch import nn
@@ -7,139 +7,251 @@ import faiss
 import os
 import json
 import logging
-from sklearn.model_selection import train_test_split
 import math
 import time
+import pickle # 用於保存/加載 Faiss 對象狀態
+from typing import Optional
 
-from .abstract_vq import AbstractVQ
+# 假設 abstract_vq 在父目錄或可導入
+try:
+    from .abstract_vq import AbstractVQ
+except ImportError:
+    # Fallback if run directly or relative import fails
+    class AbstractVQ(nn.Module):
+        def __init__(self, config: dict): super().__init__(); self.config = config
+        @property
+        def is_iterative(self) -> bool: raise NotImplementedError
+        def forward(self, batch_data: torch.Tensor): raise NotImplementedError
+        def compute_loss(self, forward_outputs, batch_data) -> dict: raise NotImplementedError
+        def get_codes(self, batch_data: torch.Tensor) -> torch.Tensor: raise NotImplementedError
 
 class OPQ(AbstractVQ):
     """
     Optimized Product Quantization (OPQ) 量化器，基於 Faiss 實現。
-    
-    此版本經過重構，以確保邏輯正確性和高效性。它採用「一次性擬合」策略，
-    分別訓練 OPQ 旋轉矩陣和 ProductQuantizer 碼本，用於對向量進行編碼。
+    採用「一次性擬合」策略，可保存/加載狀態以避免重複訓練。
+    此版本仅修改 opq.py，通过读写独立的 .pkl 状态文件来解决 main.py 中 load_state_dict 无法恢复 Faiss 对象的问题。
     """
     def __init__(self, config: dict, input_size: int):
-        """
-        初始化 OPQ 量化器。
-        """
         super().__init__(config)
         self.config = config
         self.input_size = input_size
+        self.logger = logging.getLogger(self.__class__.__name__)
 
-        # 從 config 的 'opq' 節點讀取參數
-        model_params = config['opq']['model_params']
-        self.num_levels = model_params['num_levels']
-        self.codebook_size = model_params['codebook_size']
-        
+        # --- 讀取配置 ---
+        node = config.get("opq", {})
+        model_params = node.get("model_params", {})
+        train_params = node.get("training_params", {})
+
+        self.num_levels = model_params.get('num_levels', 8)
+        self.codebook_size = model_params.get('codebook_size', 256)
+        self.n_codebook_bits = int(math.log2(self.codebook_size))
+        if 2**self.n_codebook_bits != self.codebook_size:
+            raise ValueError(f"OPQ 的 codebook_size ({self.codebook_size}) 必須是 2 的冪。")
+
         if 'faiss_omp_num_threads' in model_params:
             faiss.omp_set_num_threads(model_params['faiss_omp_num_threads'])
+            self.logger.info(f"Faiss OMP 執行緒數設置為: {model_params['faiss_omp_num_threads']}")
+        self.max_train_samples = train_params.get("max_train_samples", 256 * 1000)
 
-        # 初始化內部狀態
+        # --- 內部狀態 ---
         self.fitted = False
-        self.opq_matrix = None           # 用於儲存訓練好的旋轉矩陣
-        self.pq = None                   # 用於儲存訓練好的 ProductQuantizer
+        self.opq_matrix: Optional[faiss.OPQMatrix] = None
+        self.pq: Optional[faiss.ProductQuantizer] = None
         self._embedding_buffer = []
-        self._total_item_count = None
+        self._total_item_count = config.get('total_item_count', -1)
+        if self._total_item_count <= 0:
+             raise ValueError("OPQ 模型需要 'total_item_count' > 0 在 config 中被設置。")
 
-        logging.info("OPQ 量化器已初始化 (等待数据攒齐进行拟合)。")
+        # === ✨ 推斷狀態文件路徑 ===
+        # 假設 .pkl 文件與 .pth 文件在同一目錄，文件名類似
+        # config['save_path'] 應該是 .pth 文件的完整路徑
+        save_path_pth = config.get('save_path', None)
+        if save_path_pth:
+            self.state_path = save_path_pth.replace('_best.pth', '_fitted_state.pkl').replace('_fitted.pth', '_fitted_state.pkl')
+            self.logger.info(f"推斷的 OPQ 狀態文件路徑: {self.state_path}")
+        else:
+            # 如果 config 沒有 save_path，則無法保存/加載狀態
+            self.logger.warning("Config 中缺少 'save_path'，無法推斷狀態文件路徑，每次運行都將重新擬合。")
+            self.state_path = None
+        # === 推斷結束 ===
+
+
+        self.logger.info(f"OPQ 初始化: Levels(M)={self.num_levels}, CodebookSize(K)={self.codebook_size}, Bits={self.n_codebook_bits}, InputDim={self.input_size}")
+        # 嘗試在初始化時就加載狀態
+        if self.state_path:
+            self.load_fitted_state(self.state_path)
+        if not self.fitted:
+            self.logger.info("模型狀態: 未擬合 (等待數據)。")
+
 
     @property
-    def is_iterative(self) -> bool:
-        # 覆寫父類屬性，告訴 Trainer 這是一次性擬合的模型
-        return False
+    def is_iterative(self) -> bool: return False # 告訴 Trainer 這是一次性擬合
 
-    def _fit_faiss(self):
-        """
-        在數據攢齊後，執行一次性的 Faiss 擬合來訓練 OPQ 旋轉矩陣和 PQ 碼本。
-        """
-        if self.fitted:
+    # === 狀態保存與加載 (与之前版本一致) ===
+    def save_fitted_state(self, path: str):
+        """保存訓練好的 OPQ 狀態到 .pkl 文件。"""
+        if not self.fitted or self.opq_matrix is None or self.pq is None:
+            self.logger.error("OPQ 模型尚未成功擬合，無法保存狀態。")
             return
+        state = { 'opq_matrix': self.opq_matrix, 'pq': self.pq, 'fitted': self.fitted }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, 'wb') as f: pickle.dump(state, f)
+            self.logger.info(f"OPQ 狀態已保存到: {path}")
+        except Exception as e: self.logger.error(f"保存 OPQ 狀態到 {path} 失敗: {e}")
+
+    def load_fitted_state(self, path: str) -> bool:
+        """從 .pkl 文件加載 OPQ 狀態。"""
+        if not os.path.exists(path):
+            # self.logger.info(f"未找到 OPQ 狀態文件: {path}。模型需要擬合。") # 减少日志干扰
+            return False
+        try:
+            with open(path, 'rb') as f: state = pickle.load(f)
+            if not isinstance(state.get('opq_matrix'), faiss.OPQMatrix): raise TypeError("opq_matrix type mismatch")
+            if not isinstance(state.get('pq'), faiss.ProductQuantizer): raise TypeError("pq type mismatch")
+
+            self.opq_matrix = state['opq_matrix']
+            self.pq = state['pq']
+            self.fitted = state.get('fitted', False)
+
+            if self.fitted: self.logger.info(f"成功从 {path} 加载 OPQ 状态。")
+            # (省略参数验证日志，保持简洁)
+            return self.fitted
+        except Exception as e:
+            self.logger.error(f"加载 OPQ 状态失败 ({path}): {e}。模型需要重新拟合。")
+            self.fitted = False; self.opq_matrix = None; self.pq = None
+            return False
+
+    # === Faiss 擬合邏輯 (只在需要時執行) ===
+    def _fit_faiss(self):
+        """ 在數據攢齊後，执行一次性的 Faiss 拟合，并保存状态。"""
+        if self.fitted: return # 如果已加载或已拟合，直接返回
+
+        if not self._embedding_buffer: self.logger.error("拟合错误：Embedding 缓冲区为空。"); return
 
         logging.info("OPQ 数据已攒齐，开始一次性 Faiss 拟合...")
         total_start_time = time.time()
-        
-        embeddings_np = torch.cat(self._embedding_buffer, dim=0).cpu().numpy().astype('float32')
-        self._embedding_buffer = []
+        embeddings_np = torch.cat(self._embedding_buffer, dim=0).numpy().astype('float32')
+        self._embedding_buffer = [] # 清空缓冲区
 
-        # 為了訓練，從數據中隨機抽樣一部分即可
-        max_train_samples = 256 * 1000 # 例如，最多使用 25.6 萬個樣本
-        train_size = min(len(embeddings_np), max_train_samples)
-        train_indices = np.random.choice(len(embeddings_np), size=train_size, replace=False)
-        train_vectors = embeddings_np[train_indices]
-        logging.info(f"從 {len(embeddings_np)} 個向量中採樣 {train_size} 個用於訓練。")
+        train_size = min(len(embeddings_np), self.max_train_samples)
+        if train_size < len(embeddings_np):
+             train_indices = np.random.choice(len(embeddings_np), size=train_size, replace=False)
+             train_vectors = embeddings_np[train_indices]
+             logging.info(f"从 {len(embeddings_np)} 个向量中随机采样 {train_size} 个用于训练。")
+        else:
+             train_vectors = embeddings_np
+             logging.info(f"使用全部 {len(embeddings_np)} 个向量进行训练。")
 
-        # --- 步驟 1: 訓練 OPQ 旋轉矩陣 ---
-        logging.info(f"步驟 1: 訓練 OPQ 旋轉矩陣 (num_levels={self.num_levels})... (此步驟可能耗時較長)")
-        start_time = time.time()
-        # OPQMatrix 的 M 參數就是 num_levels
-        opq_matrix = faiss.OPQMatrix(self.input_size, self.num_levels)
-        opq_matrix.train(train_vectors)
-        self.opq_matrix = opq_matrix
-        logging.info(f"步驟 1 完成，耗時 {time.time() - start_time:.2f} 秒。")
+        if train_vectors.shape[0] == 0: self.logger.error("拟合错误：没有有效的训练向量。"); return
 
-        # --- 步驟 2: 訓練 Product Quantizer ---
-        logging.info("步驟 2: 應用旋轉矩陣並訓練 PQ 碼本...")
-        start_time = time.time()
-        # 對訓練數據應用旋轉
-        rotated_train_vectors = self.opq_matrix.apply_py(train_vectors)
+        try:
+            # --- 步骤 1: 训练 OPQ ---
+            logging.info(f"步骤 1: 训练 OPQ 旋转矩阵 (M={self.num_levels})..."); start_time = time.time()
+            opq_matrix_obj = faiss.OPQMatrix(self.input_size, self.num_levels)
+            opq_matrix_obj.train(train_vectors)
+            self.opq_matrix = opq_matrix_obj
+            logging.info(f"步骤 1 完成，耗时 {time.time() - start_time:.2f} 秒。")
 
-        # 核心：創建並訓練一個 ProductQuantizer
-        n_codebook_bits = int(math.log2(self.codebook_size))
-        self.pq = faiss.ProductQuantizer(self.input_size, self.num_levels, n_codebook_bits)
-        self.pq.train(rotated_train_vectors)
-        logging.info(f"步驟 2 完成，耗時 {time.time() - start_time:.2f} 秒。")
-        
-        self.fitted = True
-        logging.info(f"OPQ 擬合完成，總耗時 {time.time() - total_start_time:.2f} 秒。")
+            # --- 步骤 2: 训练 PQ ---
+            logging.info("步骤 2: 应用旋转矩阵并训练 PQ 码本..."); start_time = time.time()
+            rotated_train_vectors = self.opq_matrix.apply_py(train_vectors)
+            pq_cpu = faiss.ProductQuantizer(self.input_size, self.num_levels, self.n_codebook_bits)
 
+            use_gpu = hasattr(faiss, "StandardGpuResources") and faiss.get_num_gpus() > 0
+            res = None
+            if use_gpu:
+                logging.info("检测到可用 GPU，使用 FAISS GPU 加速训练 PQ 码本。")
+                res = faiss.StandardGpuResources()
+                if self.input_size <= 1024:
+                    index_pq_gpu = faiss.GpuIndexPQ(res, self.input_size, self.num_levels, self.n_codebook_bits, faiss.METRIC_L2)
+                    index_pq_gpu.train(rotated_train_vectors)
+                    index_pq_cpu = faiss.index_gpu_to_cpu(index_pq_gpu)
+                    self.pq = index_pq_cpu.pq
+                    logging.info("GPU PQ 训练完成并已转换回 CPU。")
+                else:
+                     logging.warning(f"输入维度 {self.input_size} > 1024，GPU IndexPQ 不支持。回退到 CPU 训练 PQ。"); use_gpu = False
+            
+            if not use_gpu:
+                 logging.info("使用 CPU 进行 PQ 训练。"); pq_cpu.train(rotated_train_vectors); self.pq = pq_cpu; logging.info("CPU PQ 训练完成。")
+
+            self.fitted = True # 标记为已拟合
+            logging.info(f"步骤 2 完成，耗时 {time.time() - start_time:.2f} 秒。")
+            logging.info(f"OPQ 拟合完成，总耗时 {time.time() - total_start_time:.2f} 秒。")
+
+            # --- ✨ 拟合成功后，保存状态到 .pkl 文件 ---
+            if self.state_path:
+                self.save_fitted_state(self.state_path)
+            # --- 保存结束 ---
+
+        except Exception as e:
+            self.logger.error(f"Faiss 拟合过程中发生错误: {e}")
+            self.fitted = False; self.opq_matrix = None; self.pq = None
+            raise
+        finally:
+             if res is not None: del res
+
+    # === 与 Trainer 交互 ===
     def forward(self, batch_data: torch.Tensor) -> tuple:
-        """
-        forward 的職責是「攢數據」，直到數據量足夠觸發一次性的擬合。
-        """
-        if self.fitted:
-            return (None, None, None)
+        """ forward 的职责是「攒数据」，直到数据量足够觸發擬合。"""
+        if self.fitted: return (None, None, None) # 已拟合/加载，无需操作
 
+        # 添加数据到缓冲区
         self._embedding_buffer.append(batch_data.detach().cpu())
-
-        if self._total_item_count is None:
-            self._total_item_count = self.config.get('total_item_count', -1)
-            if self._total_item_count == -1:
-                raise ValueError("OPQ 模型需要 'total_item_count' 在 config 中被設置。")
-
         current_count = sum(len(b) for b in self._embedding_buffer)
-        
-        if current_count >= self._total_item_count:
-            self._fit_faiss()
 
-        # Trainer 看到 loss 為 None 就不會執行 backward
-        return (None, None, None)
+        # 检查是否攒够数据
+        if current_count >= self._total_item_count:
+            try:
+                self._fit_faiss() # 触发拟合
+            except Exception as e:
+                 # 如果拟合失败，仍然返回 None，让 Trainer 知道不用 backward
+                 self.logger.error(f"拟合在 forward 触发时失败: {e}")
+                 # 不需要清空 buffer，下次 forward 还会尝试
+                 
+        return (None, None, None) # Trainer 不会计算 loss
 
     def compute_loss(self, forward_outputs, batch_data) -> dict:
-        """OPQ 是一次性擬合的，沒有可迭代優化的損失函數。"""
-        return {'loss_total': 0.0}
+        """OPQ 没有迭代损失。"""
+        return {'loss_total': torch.tensor(0.0, device=batch_data.device),
+                'loss_recon': torch.tensor(0.0, device=batch_data.device)}
 
+    # === 編碼方法 ===
     @torch.no_grad()
     def get_codes(self, batch_data: torch.Tensor) -> torch.Tensor:
-        """
-        使用已擬合好的 OPQ 矩陣和 PQ 碼本，對輸入的 batch 進行量化。
-        """
+        """ 使用已拟合好的 OPQ/PQ 对输入 batch 进行量化。 """
+        self.eval()
+
+        # === ✨ 自救逻辑：如果未拟合，尝试从文件加载 ===
         if not self.fitted:
-            logging.warning("OPQ 在 get_codes 時仍未擬合，將執行緊急擬合。")
-            self._fit_faiss()
-            if not self.fitted:
-                 raise RuntimeError("OPQ 緊急擬合失敗，無法生成 codes。")
-        
-        # 將輸入數據轉為 CPU 上的 float32 numpy 陣列
+            self.logger.warning("OPQ 在 get_codes 时 fitted=False，尝试从状态文件加载...")
+            if self.state_path and self.load_fitted_state(self.state_path):
+                 self.logger.info("成功从状态文件恢复拟合状态。")
+            else:
+                 # 如果 state_path 不存在或加载失败，则抛出错误
+                 self.logger.error("无法从状态文件恢复，OPQ 模型未拟合。")
+                 raise RuntimeError("OPQ 模型在 get_codes 時未擬合，且无法从状态文件恢复。")
+        # === 自救结束 ===
+
+        # 检查 Faiss 对象是否存在 (以防万一加载失败但 fitted 意外为 True)
+        if self.opq_matrix is None or self.pq is None:
+             self.logger.error("OPQ Faiss 对象为空，即使 fitted=True。状态文件可能已损坏。")
+             raise RuntimeError("OPQ Faiss 对象为空，无法执行 get_codes。")
+
+        # 将输入转为 CPU numpy float32
         batch_np = batch_data.cpu().numpy().astype('float32')
         
-        # ✅ 關鍵邏輯修正：
-        # 1. 先對輸入向量應用訓練好的旋轉矩陣
-        rotated_batch = self.opq_matrix.apply_py(batch_np)
-        
-        # 2. 再對旋轉後的向量計算 PQ 碼
-        codes_np = self.pq.compute_codes(rotated_batch)
-        
-        # 將 numpy uint8 陣列轉換為 PyTorch Long Tensor，並移回原始設備
-        return torch.from_numpy(codes_np.astype(np.int64)).long().to(batch_data.device)
+        try:
+            # 1. 应用 OPQ 旋转
+            rotated_batch = self.opq_matrix.apply_py(batch_np)
+            # 2. 计算 PQ 码 (uint8 numpy)
+            codes_np_uint8 = self.pq.compute_codes(rotated_batch)
+            # 3. 转为 int64 PyTorch Long Tensor 并移回原设备
+            codes_tensor = torch.from_numpy(codes_np_uint8.astype(np.int64)).long().to(batch_data.device)
+            return codes_tensor
+        except Exception as e:
+             self.logger.error(f"OPQ get_codes 失败: {e}")
+             error_codes = torch.full((batch_data.shape[0], self.num_levels), -1, dtype=torch.long, device=batch_data.device)
+             return error_codes
+
+# --- (移除测试代码，保持脚本纯净) ---
