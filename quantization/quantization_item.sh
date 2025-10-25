@@ -1,6 +1,6 @@
 python main.py \
-  --model_name vqvae \
-  --dataset_name Sports_and_Outdoors \
+  --model_name mqvae \
+  --dataset_name Toys_and_Games \
   --embedding_modality text \
   --embedding_model text-embedding-3-large
 
