@@ -10,7 +10,7 @@
 
 ```bash
 # Amazon 数据集
-python download_data.py --source amazon --dataset Toys_and_Games
+python download_data.py --source amazon --dataset Sports_and_Outdoors
 
 # MovieLens 数据集
 python download_data.py --source movielens --dataset ml-1m
@@ -23,7 +23,7 @@ python download_data.py --source movielens --dataset ml-1m
 
 ```bash
 # Amazon 类数据集
-python download_images.py --dataset_type amazon --dataset Musical_Instruments
+python download_images.py --dataset_type amazon --dataset Sports_and_Outdoors
 
 # MovieLens 数据集
 python download_images.py --dataset_type movielens --dataset ml-1m
@@ -37,7 +37,7 @@ python download_images.py --dataset_type movielens --dataset ml-1m
 
 ```bash
 # Amazon
-python process_data.py --dataset_type amazon --dataset Toys_and_Games
+python process_data.py --dataset_type amazon --dataset Sports_and_Outdoors
 
 # MovieLens
 python process_data.py --dataset_type movielens --dataset ml-1m
@@ -67,7 +67,7 @@ python generate_embeddings/text_embedding.py \
 python generate_embeddings/text_embedding.py \
   --dataset_type amazon \
   --mode api \
-  --dataset Toys_and_Games \
+  --dataset Sports_and_Outdoors \
   --sent_emb_model text-embedding-3-large \
   --openai_api_key sk-492a02uVsAauNrYsP4YRW2pvAsELc20hoHJeUh2Sop3GiL3C \
   --openai_base_url https://yunwu.ai/v1 \
@@ -97,14 +97,23 @@ python generate_embeddings/text_embeddings.py \
 
 ```bash
 python generate_embeddings/image_embedding.py \
-  --dataset Musical_Instruments \
-  --model_name_or_path /home/peiyu/PEIYU/LLM_Models/openai-mirror/clip-vit-base-patch32
+  --dataset Baby \
+  --model_name_or_path /home/wj/peiyu/LLM_Models/openai-mirror/clip-vit-base-patch32
 ```
 
 ### 协同特征
 
 ```bash
 python generate_embeddings/cf_embedding.py --dataset Musical_Instruments --epochs 50 --hidden_dim 512
+```
+
+### CLIP文本+视觉
+
+```bash
+python generate_embeddings/clip_embedding.py \
+  --dataset Baby \
+  --dataset_type amazon \
+  --model_name_or_path /home/wj/peiyu/LLM_Models/openai-mirror/clip-vit-base-patch32 
 ```
 
 ---
@@ -115,7 +124,7 @@ python generate_embeddings/cf_embedding.py --dataset Musical_Instruments --epoch
 
 ```bash
 python generate_embeddings/fuse_embedding.py \
-  --dataset Musical_Instruments \
+  --dataset Baby \
   --text_model_tag "text-embedding-3-large" \
   --image_model_tag "clip-vit-base-patch32"
 ```
