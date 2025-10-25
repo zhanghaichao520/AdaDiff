@@ -126,7 +126,7 @@ class GPT2(AbstractModel):
             max_new_tokens=code_len,
             early_stopping=False,
             pad_token_id=self.config['token_params']['pad_token_id'],
-            eos_token_id=self.config['token_params']['eos_token_id']
+            eos_token_id=None
         )
         
         # 2. 后处理 (不变)

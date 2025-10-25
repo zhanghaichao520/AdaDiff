@@ -124,65 +124,69 @@ class OPQ(AbstractVQ):
 
     # === Faiss 擬合邏輯 (只在需要時執行) ===
     def _fit_faiss(self):
-        """ 在數據攢齊後，执行一次性的 Faiss 拟合，并保存状态。"""
-        if self.fitted: return # 如果已加载或已拟合，直接返回
+        """在數據攢齊後，执行一次性的 Faiss 拟合，并保存状态（CPU 训练，避免 GpuIndexPQ 不存在的问题）。"""
+        if self.fitted:
+            return  # 已拟合/已加载，直接返回
 
-        if not self._embedding_buffer: self.logger.error("拟合错误：Embedding 缓冲区为空。"); return
+        if not self._embedding_buffer:
+            self.logger.error("拟合错误：Embedding 缓冲区为空。")
+            return
 
-        logging.info("OPQ 数据已攒齐，开始一次性 Faiss 拟合...")
+        logging.info("OPQ 数据已攒齐，开始一次性 Faiss 拟合（CPU PQ 训练）...")
         total_start_time = time.time()
-        embeddings_np = torch.cat(self._embedding_buffer, dim=0).numpy().astype('float32')
-        self._embedding_buffer = [] # 清空缓冲区
 
+        # 收集并转换为 float32 numpy
+        embeddings_np = torch.cat(self._embedding_buffer, dim=0).cpu().numpy().astype('float32')
+        self._embedding_buffer = []  # 清空缓冲
+
+        # 采样训练子集
         train_size = min(len(embeddings_np), self.max_train_samples)
         if train_size < len(embeddings_np):
-             train_indices = np.random.choice(len(embeddings_np), size=train_size, replace=False)
-             train_vectors = embeddings_np[train_indices]
-             logging.info(f"从 {len(embeddings_np)} 个向量中随机采样 {train_size} 个用于训练。")
+            train_indices = np.random.choice(len(embeddings_np), size=train_size, replace=False)
+            train_vectors = embeddings_np[train_indices]
+            logging.info(f"从 {len(embeddings_np)} 个向量中随机采样 {train_size} 个用于训练。")
         else:
-             train_vectors = embeddings_np
-             logging.info(f"使用全部 {len(embeddings_np)} 个向量进行训练。")
+            train_vectors = embeddings_np
+            logging.info(f"使用全部 {len(embeddings_np)} 个向量进行训练。")
 
-        if train_vectors.shape[0] == 0: self.logger.error("拟合错误：没有有效的训练向量。"); return
+        if train_vectors.shape[0] == 0:
+            self.logger.error("拟合错误：没有有效的训练向量。")
+            return
 
         try:
-            # --- 步骤 1: 训练 OPQ ---
-            logging.info(f"步骤 1: 训练 OPQ 旋转矩阵 (M={self.num_levels})..."); start_time = time.time()
+            # --- 步骤 1：训练 OPQ 旋转矩阵（CPU）---
+            logging.info(f"步骤 1: 训练 OPQ 旋转矩阵 (M={self.num_levels})...")
+            t0 = time.time()
             opq_matrix_obj = faiss.OPQMatrix(self.input_size, self.num_levels)
             opq_matrix_obj.train(train_vectors)
             self.opq_matrix = opq_matrix_obj
-            logging.info(f"步骤 1 完成，耗时 {time.time() - start_time:.2f} 秒。")
+            logging.info(f"步骤 1 完成，耗时 {time.time() - t0:.2f} 秒。")
 
-            # --- 步骤 2: 训练 PQ ---
-            logging.info("步骤 2: 应用旋转矩阵并训练 PQ 码本..."); start_time = time.time()
+            # --- 步骤 2：应用旋转并训练 PQ 码本（CPU）---
+            logging.info("步骤 2: 应用旋转矩阵并训练 PQ 码本（CPU）...")
+            t0 = time.time()
             rotated_train_vectors = self.opq_matrix.apply_py(train_vectors)
+
             pq_cpu = faiss.ProductQuantizer(self.input_size, self.num_levels, self.n_codebook_bits)
+            pq_cpu.train(rotated_train_vectors)   # 统一使用 CPU 训练，避免 GpuIndexPQ 不存在
+            self.pq = pq_cpu
 
-            use_gpu = hasattr(faiss, "StandardGpuResources") and faiss.get_num_gpus() > 0
-            res = None
-            if use_gpu:
-                logging.info("检测到可用 GPU，使用 FAISS GPU 加速训练 PQ 码本。")
-                res = faiss.StandardGpuResources()
-                if self.input_size <= 1024:
-                    index_pq_gpu = faiss.GpuIndexPQ(res, self.input_size, self.num_levels, self.n_codebook_bits, faiss.METRIC_L2)
-                    index_pq_gpu.train(rotated_train_vectors)
-                    index_pq_cpu = faiss.index_gpu_to_cpu(index_pq_gpu)
-                    self.pq = index_pq_cpu.pq
-                    logging.info("GPU PQ 训练完成并已转换回 CPU。")
-                else:
-                     logging.warning(f"输入维度 {self.input_size} > 1024，GPU IndexPQ 不支持。回退到 CPU 训练 PQ。"); use_gpu = False
-            
-            if not use_gpu:
-                 logging.info("使用 CPU 进行 PQ 训练。"); pq_cpu.train(rotated_train_vectors); self.pq = pq_cpu; logging.info("CPU PQ 训练完成。")
+            logging.info(f"步骤 2 完成，耗时 {time.time() - t0:.2f} 秒。")
 
-            self.fitted = True # 标记为已拟合
-            logging.info(f"步骤 2 完成，耗时 {time.time() - start_time:.2f} 秒。")
+            self.fitted = True
             logging.info(f"OPQ 拟合完成，总耗时 {time.time() - total_start_time:.2f} 秒。")
 
-            # --- ✨ 拟合成功后，保存状态到 .pkl 文件 ---
+            # 可选：保存 .pkl 状态（若配置了 state_path）
             if self.state_path:
                 self.save_fitted_state(self.state_path)
-            # --- 保存结束 ---
+
+        except Exception as e:
+            self.logger.error(f"Faiss 拟合过程中发生错误: {e}")
+            self.fitted = False
+            self.opq_matrix = None
+            self.pq = None
+            raise
+
 
         except Exception as e:
             self.logger.error(f"Faiss 拟合过程中发生错误: {e}")

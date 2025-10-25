@@ -12,7 +12,7 @@ from pathlib import Path
 import importlib
 from collections.abc import Mapping
 
-VALID_QUANT_METHODS = {"rkmeans", "rvq", "rqvae", "opq", "pq"}
+VALID_QUANT_METHODS = {"rkmeans", "rvq", "rqvae", "opq", "pq", 'vqvae'}
 
 def _ensure_dir_exists(dir_path: Path):
     """确保目录存在"""

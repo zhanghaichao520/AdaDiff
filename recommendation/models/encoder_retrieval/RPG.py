@@ -88,6 +88,17 @@ class RPG(AbstractModel):
     @property
     def task_type(self) -> str: return 'retrieval'
 
+    @property
+    def n_parameters(self) -> str:
+        """ (Helper property to get parameter count) """
+        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        emb_params = sum(p.numel() for p in self.gpt2.get_input_embeddings().parameters() if p.requires_grad)
+        return (
+            f'# Embedding parameters: {emb_params:,}\n'
+            f'# Non-embedding parameters: {total_params - emb_params:,}\n'
+            f'# Total trainable parameters: {total_params:,}\n'
+        )
+
     def _ensure_item_id2tokens_on_device(self, device):
          if self.item_id2tokens is None or self.item_id2tokens.device != device:
              self.item_id2tokens = self.item_id2tokens_cpu.to(device)
@@ -206,31 +217,96 @@ class RPG(AbstractModel):
 
     # --- _generate_ranklist 和 evaluate_step 保持不變 (它們只用最後狀態) ---
     def _generate_ranklist(self, batch: Dict, topk: int) -> torch.Tensor:
+        """
+        (v4 - 保持不變) 
+        為評估生成 topk 排序列表。
+        只使用 *最後* 的隱藏狀態來表示用戶。
+        """
         input_item_ids = batch['input_ids']; attention_mask = batch['attention_mask']; batch_size = input_item_ids.shape[0]
         current_device = input_item_ids.device
         self._ensure_item_id2tokens_on_device(current_device)
+        
+        # --- 1. Item ID -> Item Embedding ---
         input_tokens = self.item_id2tokens[input_item_ids]; token_embs = self.gpt2.wte(input_tokens); input_embs = token_embs.mean(dim=2)
+        
+        # --- 2. GPT-2 ---
         outputs = self.gpt2(inputs_embeds=input_embs, attention_mask=attention_mask)
+        
+        # --- 3. 獲取 *最後* 的隱藏狀態 ---
         seq_lens = attention_mask.sum(dim=1); valid_lens = torch.clamp(seq_lens - 1, min=0)
         max_seq_len_in_batch = outputs.last_hidden_state.shape[1]
         valid_lens = torch.min(valid_lens, torch.tensor(max_seq_len_in_batch - 1, device=current_device))
-        last_hidden_states = outputs.last_hidden_state[torch.arange(batch_size, device=current_device), valid_lens]
-        final_states = [head(last_hidden_states) for head in self.pred_heads]; final_states = torch.stack(final_states, dim=1); final_states = F.normalize(final_states, dim=-1)
-        token_emb = self.gpt2.wte.weight; token_emb_norm = F.normalize(token_emb, dim=-1)
-        all_item_embs = self.gpt2.wte(self.item_id2tokens); all_item_embs = F.normalize(all_item_embs, dim=-1)
-        item_scores = torch.einsum('bld,ild->bi', final_states, all_item_embs)
-        _, topk_indices = torch.topk(item_scores, k=topk, dim=1)
-        return topk_indices # 1-based IDs
+        last_hidden_states = outputs.last_hidden_state[torch.arange(batch_size, device=current_device), valid_lens] # (B, D)
+        
+        # --- 4. 應用 Heads 到 *最後* 狀態 ---
+        final_states = [head(last_hidden_states) for head in self.pred_heads]; final_states = torch.stack(final_states, dim=1); # (B, L_code, D)
+        final_states = F.normalize(final_states, dim=-1) # (B, L_code, D)
+        
+        # --- 5. 檢索 (計算與 *所有* item 的相似度) ---
+        # 獲取所有 item 的 code token embeddings
+        # 注意: 這裡 item_id2tokens[0] 是 padding，我們不應該用它來計算相似度
+        # 我們假設 all_item_embs[0] 是 padding, all_item_embs[1] 是 item_id=1, ...
+        all_item_codes = self.item_id2tokens[1:] # (N_items, L_code)
+        all_item_embs = self.gpt2.wte(all_item_codes) # (N_items, L_code, D)
+        all_item_embs = F.normalize(all_item_embs, dim=-1) # (N_items, L_code, D)
+        
+        # 計算 User (B, L_code, D) 和 Items (N_items, L_code, D) 之間的點積
+        # (B, L_code, D) @ (N_items, L_code, D).transpose(1, 2) -> (B, L_code, N_items, D) ? No
+        # 我們需要 (B, N_items)
+        # einsum 'bld,ild->bi' 
+        # b=batch_size, l=L_code, d=Dim
+        # i=N_items
+        item_scores = torch.einsum('bld,ild->bi', final_states, all_item_embs) # (B, N_items)
+        
+        # 獲取 TopK
+        _, topk_indices = torch.topk(item_scores, k=topk, dim=1) # (B, k)
+        
+        # topk_indices 是 0-based (0..N_items-1)，對應 item_id 1..N_items
+        # 所以我們需要 +1 讓它變回 1-based item IDs
+        return topk_indices + 1 # (B, k), 1-based Item IDs
 
+    # ==================== EVALUATE (核心修正) ====================
     def evaluate_step(self, batch: Dict, topk_list: List[int]) -> Dict[str, float]:
+        """
+        【最終還原版 v4 - 已修正】
+        此版本返回指標的 *总和 (sum)* 和批次大小 ('count')，
+        以配合 trainer.py 中的正确平均值计算。
+        """
         max_k = max(topk_list)
-        ranked_item_indices = self._generate_ranklist(batch, topk=max_k) # 1-based IDs
-        target_ids = batch['target_ids'].unsqueeze(1) # 0-based IDs from dataloader
-        hits = ((ranked_item_indices - 1) == target_ids).cpu() # Convert ranked to 0-based
+        
+        # 1. 獲取 Ranklist (1-based IDs) 和 Targets (0-based IDs)
+        # _generate_ranklist 返回 1-based item IDs
+        ranked_item_indices = self._generate_ranklist(batch, topk=max_k) # (B, max_k)
+        
+        # 從 dataloader 獲取 0-based target IDs
+        target_ids = batch['target_ids'].unsqueeze(1) # (B, 1), 0-based IDs
+        
+        # ✅ 獲取真實的批次大小
+        batch_size = target_ids.shape[0]
+
+        # 2. 計算命中 (boolean tensor)
+        # 將 1-based ranked list 轉換為 0-based, 然後與 0-based target 比較
+        hits = ((ranked_item_indices - 1) == target_ids).cpu() # (B, max_k)
+
+        # 3. 計算指標總和
         batch_metrics = {}
         for k in topk_list:
-            pos_index_k = hits[:, :k]
-            if pos_index_k.numel() > 0: recall = recall_at_k(pos_index_k, k).mean().item(); ndcg = ndcg_at_k(pos_index_k, k).mean().item()
-            else: recall = 0.0; ndcg = 0.0
-            batch_metrics[f'Recall@{k}'] = recall; batch_metrics[f'NDCG@{k}'] = ndcg
+            pos_index_k = hits[:, :k] # (B, k)
+            
+            if pos_index_k.numel() > 0:
+                # ✅ 計算批次內的總和 (sum)，而不是平均值 (mean)
+                recall_sum = recall_at_k(pos_index_k, k).sum().item() 
+                ndcg_sum = ndcg_at_k(pos_index_k, k).sum().item()
+            else:
+                recall_sum = 0.0
+                ndcg_sum = 0.0
+                
+            # 存儲總和
+            batch_metrics[f'Recall@{k}'] = recall_sum 
+            batch_metrics[f'NDCG@{k}'] = ndcg_sum
+            
+        # ✅ 4. 添加批次大小 'count'
+        batch_metrics['count'] = float(batch_size) 
+          
+        # 返回包含 count 和 指標總和 的字典
         return batch_metrics

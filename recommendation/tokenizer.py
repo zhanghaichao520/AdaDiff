@@ -15,6 +15,7 @@ class BaseTokenizer:
         self.code_len = config['code_len']
         self.item_pad_id = 0 
         self.code_pad_list = [self.pad_token_id] * self.code_len
+        self.max_len = config['model_params']['max_len']
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         raise NotImplementedError
@@ -142,14 +143,84 @@ class GenerativeTokenizer(BaseTokenizer):
         }
 
 # --- RetrievalTokenizer 和 get_tokenizer 保持不變 ---
+# --- RetrievalTokenizer (✅ 已补全) ---
 class RetrievalTokenizer(BaseTokenizer):
-     # (保持之前的版本不變)
+    """
+    为 RPG 模型准备数据。
+    GenRecDataset 返回: {'history': [0, 0, 5, 10], 'target': 20} (0-based IDs)
+    RPG (forward) 期望:
+        - 'input_ids': [0, 0, 6, 11] (1-based IDs, 0-padded)
+        - 'attention_mask': [0, 0, 1, 1]
+        - 'labels_seq': [-100, -100, -100, 20] (0-based target, -100-padded)
+    RPG (evaluate_step) 期望:
+        - 'input_ids': (同上)
+        - 'attention_mask': (同上)
+        - 'target_ids': [20] (0-based target)
+    """
     def __init__(self, config: Dict[str, Any], item_to_code_map: Dict[int, List[int]]):
         super().__init__(config, item_to_code_map)
-        logger.info(f"RetrievalTokenizer (RPG) 初始化")
+        logger.info(f"RetrievalTokenizer (RPG) 初始化, max_len={self.max_len}")
+        
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # (保持之前的版本不變)
-        pass # 省略代碼
+        
+        # 1. 初始化列表
+        history_seqs_1based = []
+        label_seqs = []
+        target_ids_0based = []
+
+        for item in batch:
+            hist_0based = item['history'] # e.g., [0, 0, 5, 10]
+            target_0based = item['target']  # e.g., 20
+
+            # 2. 转换 History (Input IDs)
+            # 过滤掉 padding (0)，然后将 0-based IDs 转换为 1-based IDs
+            valid_hist_0based = [x for x in hist_0based if x != self.item_pad_id]
+            valid_hist_1based = [x + 1 for x in valid_hist_0based]
+            
+            # 截断到 max_len
+            valid_hist_1based = valid_hist_1based[-self.max_len:]
+            seq_len = len(valid_hist_1based)
+            history_seqs_1based.append(torch.tensor(valid_hist_1based, dtype=torch.long))
+
+            # 3. 准备 labels_seq (用于训练)
+            # 只有最后一个时间步有-label，其他都是 -100
+            labels = [-100] * seq_len
+            if seq_len > 0:
+                labels[-1] = target_0based # 在最后一个有效位置放 0-based 目标
+            label_seqs.append(torch.tensor(labels, dtype=torch.long))
+
+            # 4. 准备 target_ids (用于评估)
+            target_ids_0based.append(target_0based)
+
+        # 5. Pad Input IDs (使用 0 进行 right-padding)
+        padded_input_ids = pad_sequence(
+            history_seqs_1based, 
+            batch_first=True, 
+            padding_value=self.item_pad_id # self.item_pad_id 必须是 0
+        )
+        
+        # 6. 创建 Attention Mask
+        attention_mask = (padded_input_ids != self.item_pad_id).long()
+        
+        # 7. Pad Labels Seq (使用 -100 进行 right-padding)
+        padded_labels_seq = pad_sequence(
+            label_seqs, 
+            batch_first=True, 
+            padding_value=-100 # RPG (forward) 期望 -100
+        )
+        
+        # 8. Stack Target IDs
+        target_ids = torch.tensor(target_ids_0based, dtype=torch.long)
+
+        # 确保 padding 后的长度一致
+        # (pad_sequence 会自动处理)
+        
+        return {
+            'input_ids': padded_input_ids,    # (B, L_item) 1-based IDs, 0-padded
+            'attention_mask': attention_mask, # (B, L_item)
+            'labels_seq': padded_labels_seq,  # (B, L_item) 0-based target, -100-padded
+            'target_ids': target_ids          # (B,) 0-based target
+        }
 
 def get_tokenizer(model_name: str, config: Dict[str, Any], item_to_code_map: Dict[int, List[int]]) -> Callable:
     """

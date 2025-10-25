@@ -18,7 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description="GenRec Universal Training Pipeline")
     parser.add_argument('--model', type=str, required=True, help='模型名稱 (e.g., TIGER, GPT2, RPG)')
     parser.add_argument('--dataset', type=str, required=True, help='数据集名稱 (e.g., Beauty)')
-    parser.add_argument('--quant_method', type=str, required=True, choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq'],
+    parser.add_argument('--quant_method', type=str, required=True, choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq', 'vqvae'],
                         help='量化方法')
     args = parser.parse_args()
 
