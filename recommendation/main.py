@@ -13,14 +13,18 @@ from tokenizer import get_tokenizer
 from trainer import train_one_epoch, evaluate
 from utils import load_and_process_config, setup_logging, set_seed, get_model_class
 
-# ✅ (新增) 导入Trie构建器和Trie类
-# (我们假设 prefix_trie.py 位于 utils/ 目录下)
-try:
-    from utils.prefix_trie import build_trie_from_codebook, Trie
-except ImportError:
-    logging.warning("无法导入 utils.prefix_trie。前缀树功能将不可用。")
-    Trie = None 
-    build_trie_from_codebook = None
+import sys
+from pathlib import Path
+
+# 获取项目根目录路径（main.py 的上一级目录的上一级）
+root = Path(__file__).resolve().parent  # recommendation/
+root_parent = root.parent               # 项目根目录
+
+if str(root_parent) not in sys.path:
+    sys.path.insert(0, str(root_parent))
+
+from recommendation.models.generation.prefix_tree import Trie, build_trie_from_codebook
+
 
 def main():
     # === 1. 解析命令列參數 ===

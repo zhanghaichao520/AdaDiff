@@ -4,15 +4,19 @@ import imp
 from typing import Any, Dict, List, Optional
 import torch
 import logging
+logger = logging.getLogger(__name__)
 import transformers
 
-# 明确地从升级后的 abstract_model 导入
-from ..abstract_model import AbstractModel 
-from generation.prefix_tree import Trie
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from metrics import recall_at_k, ndcg_at_k
+root = Path(__file__).resolve().parents[3]
+if str(root) not in sys.path:
+    sys.path.insert(0, str(root))
+
+from recommendation.metrics import recall_at_k, ndcg_at_k
+from recommendation.models.generation.prefix_tree import Trie
+from recommendation.models.abstract_model import AbstractModel
+
 
 
 T5ForConditionalGeneration = transformers.T5ForConditionalGeneration
