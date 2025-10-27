@@ -19,3 +19,7 @@ model_params:
   # 其他 GPT-2 參數 (可選)
   layer_norm_epsilon: 1e-5
   initializer_range: 0.02
+
+training_params:
+  lr: 0.0001 
+  batch_size: 1024

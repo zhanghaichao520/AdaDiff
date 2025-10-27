@@ -69,30 +69,40 @@ class GPT2(AbstractModel):
     
     def forward(self, batch: Dict) -> Dict:
         """
-        為 Decoder-Only 模型準備輸入。
-        核心思想：將 history 和 labels 拼接成一個長序列進行自回歸訓練。
+        【已修正】为 Decoder-Only 模型准备输入。
+        核心思想：将 history 和 labels 拼接成一个长序列进行自回归训练。
         """
         history_ids = batch['input_ids']      # (B, L_hist_flat)
-        target_ids = batch['labels']        # (B, L_target)
+        target_ids = batch['labels']          # (B, L_target)
         history_mask = batch['attention_mask'] # (B, L_hist_flat)
         
-        # 1. 拼接輸入序列: [history_tokens, target_tokens]
+        # 1. 拼接输入序列: [history_tokens, target_tokens]
         combined_ids = torch.cat([history_ids, target_ids], dim=1)
         
-        # 2. 創建拼接後的 attention mask
+        # 2. 创建拼接后的 attention mask
         target_mask = torch.ones_like(target_ids)
         combined_mask = torch.cat([history_mask, target_mask], dim=1)
 
-        # 3. 創建用於計算 loss 的 labels
-        # 我們只計算 target 部分的 loss，所以 history 部分的 label 設為 -100
-        history_labels = torch.full_like(history_ids, -100)
-        combined_labels = torch.cat([history_labels, target_ids], dim=1)
+        # 3. ✅ 【关键修正】创建用于计算 loss 的 labels
+        #    Labels 应该是 Combined_ids 的一个副本
+        #    我们只在 "非padding" 的 token 上计算 loss
+        
+        # 复制 combined_ids 作为基础
+        combined_labels = combined_ids.clone() 
+        
+        # ✅ 使用 combined_mask 来掩盖掉所有的 padding token
+        #    (注意：你的 tokenizer 已经确保 history_ids 的 padding token ID 是 0)
+        combined_labels[combined_mask == 0] = -100
 
-        # 4. 傳給 GPT-2 模型
+        # ❌ 【BUG】原来的错误做法 (只在SFT时使用)
+        # history_labels = torch.full_like(history_ids, -100)
+        # combined_labels = torch.cat([history_labels, target_ids], dim=1)
+
+        # 4. 传给 GPT-2 模型
         outputs = self.gpt2(
             input_ids=combined_ids,
             attention_mask=combined_mask,
-            labels=combined_labels
+            labels=combined_labels  # ✅ 使用修正后的 labels
         )
         return outputs
 
