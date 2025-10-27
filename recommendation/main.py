@@ -4,14 +4,23 @@ import torch
 import torch.optim as optim
 import os
 import pprint
+from typing import Optional # ✅ (新增) 导入 Optional
 
 # ✅ 1. 從 torch.utils.data 直接導入 DataLoader
 from torch.utils.data import DataLoader 
 from dataset import GenRecDataset, item2code
-# from dataloader import GenRecDataLoader  # <-- 已刪除
 from tokenizer import get_tokenizer       
 from trainer import train_one_epoch, evaluate
 from utils import load_and_process_config, setup_logging, set_seed, get_model_class
+
+# ✅ (新增) 导入Trie构建器和Trie类
+# (我们假设 prefix_trie.py 位于 utils/ 目录下)
+try:
+    from utils.prefix_trie import build_trie_from_codebook, Trie
+except ImportError:
+    logging.warning("无法导入 utils.prefix_trie。前缀树功能将不可用。")
+    Trie = None 
+    build_trie_from_codebook = None
 
 def main():
     # === 1. 解析命令列參數 ===
@@ -20,6 +29,9 @@ def main():
     parser.add_argument('--dataset', type=str, required=True, help='数据集名稱 (e.g., Beauty)')
     parser.add_argument('--quant_method', type=str, required=True, choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq', 'vqvae'],
                         help='量化方法')
+    
+    # ✅ (已移除) 删除了 --no_trie 命令行参数
+    
     args = parser.parse_args()
 
     # === 2. 載入並處理設定檔 ===
@@ -38,17 +50,9 @@ def main():
     device = torch.device(config['training_params']['device'] if torch.cuda.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
     num_workers = config['training_params'].get('num_workers', 4)
-
-    # === 5. 創建模型與優化器 ===
-    logging.info(f"Dynamically loading model: {args.model}")
-    ModelClass = get_model_class(args.model)
-    model = ModelClass(config)
-    model.to(device)
-    logging.info(model.n_parameters)
-    logging.info("=" * 50)
-    optimizer = optim.Adam(model.parameters(), lr=float(config['training_params']['lr']))
-
-    # === 6. 載入 item_to_code 映射 ===
+    
+    # === 5. ✅ (顺序调整) 载入 item_to_code 映射 ===
+    # (必须在创建模型之前完成，因为Trie依赖它)
     logging.info("Loading item to code mapping...")
     item_to_code_map, _ = item2code(
         config['code_path'],
@@ -57,7 +61,46 @@ def main():
     )
     logging.info(f"Item to code map loaded. Total items mapped: {len(item_to_code_map)}")
 
-    # === 7. 初始化模型專屬的 Tokenizer ===
+    # === 6. ✅ (修改) 根据 config 构建前缀树 ===
+    prefix_trie: Optional[Trie] = None
+    
+    # 检查 config['evaluation_params'] 中的 'use_prefix_trie' 标志
+    # 默认值为 False (如果您希望默认不使用)
+    use_trie = config.get('evaluation_params', {}).get('use_prefix_trie', False) 
+    
+    if use_trie and build_trie_from_codebook is not None:
+        logging.info("Building Prefix Trie (enabled in config)...")
+        
+        # 获取所有合法的 code token 序列
+        all_token_sequences = list(item_to_code_map.values())
+        
+        # 获取 EOS token ID
+        eos_token_id = config['token_params']['eos_token_id']
+        
+        prefix_trie = build_trie_from_codebook(
+            token_sequences=all_token_sequences,
+            eos_token_id=eos_token_id
+        )
+    elif use_trie:
+        logging.warning("Config requested Prefix Trie, but 'utils.prefix_trie' module was not found.")
+    else:
+        logging.info("Prefix Trie is DISABLED (default or as per config).")
+
+
+    # === 7. ✅ (修改) 创建模型 (将Trie注入) ===
+    logging.info(f"Dynamically loading model: {args.model}")
+    ModelClass = get_model_class(args.model)
+    
+    # ✅ (修改) 将 config 和 prefix_trie (可能是 None) 传递给模型
+    #    (我们假设 ModelClass 的 __init__ 接受 prefix_trie=None)
+    model = ModelClass(config, prefix_trie=prefix_trie) 
+    
+    model.to(device)
+    logging.info(model.n_parameters)
+    logging.info("=" * 50)
+    optimizer = optim.Adam(model.parameters(), lr=float(config['training_params']['lr']))
+
+    # === 8. (顺序调整) 初始化模型专属的 Tokenizer ===
     logging.info(f"Initializing tokenizer for model: {args.model}")
     tokenizer_collate_fn = get_tokenizer(
         model_name=args.model,
@@ -66,7 +109,7 @@ def main():
     )
     logging.info("Tokenizer initialized.")
 
-    # === 8. 創建數據集與 DataLoader ===
+    # === 9. (顺序调整) 創建數據集與 DataLoader ===
     logging.info("Creating Datasets...")
     train_dataset = GenRecDataset(config=config, mode='train')
     validation_dataset = GenRecDataset(config=config, mode='valid')
@@ -74,7 +117,6 @@ def main():
 
     logging.info("Creating DataLoaders...")
     
-    # ✅ 2. 準備通用的 DataLoader 參數
     is_gpu_training = (torch.cuda.is_available() and num_workers > 0)
     loader_kwargs = {
         "num_workers": num_workers,
@@ -83,7 +125,6 @@ def main():
         "persistent_workers": is_gpu_training if num_workers > 0 else False
     }
 
-    # ✅ 3. 直接使用 PyTorch 官方的 DataLoader
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training_params']['batch_size'],
@@ -103,19 +144,18 @@ def main():
         **loader_kwargs
     )
 
-    # === 9. 训练-评估循环 (已修改) ===
+    # === 10. (顺序调整) 训练-评估循环 (已修改) ===
     best_ndcg = 0.0
     early_stop_counter = 0
     best_epoch = 0
     best_val_results = None
     best_test_results = None
     
-    # 从配置中获取评估间隔
-    eval_interval = config['training_params'].get('eval_interval', 1) # 默认为 1 (慢速模式)
+    eval_interval = config['training_params'].get('eval_interval', 1) 
     logging.info(f"Evaluation interval set to: {eval_interval} epoch(s)")
 
     for epoch in range(config['training_params']['num_epochs']):
-        epoch_num = epoch + 1 # 当前 epoch 编号 (从 1 开始)
+        epoch_num = epoch + 1 
         logging.info(f"--- Epoch {epoch_num}/{config['training_params']['num_epochs']} ---")
         
         # --- 训练 ---
@@ -123,7 +163,6 @@ def main():
         logging.info(f"Training loss: {train_loss:.4f}")
 
         # --- 评估 (根据 eval_interval) ---
-        # 检查是否到达评估的 epoch
         if epoch_num % eval_interval == 0:
             logging.info(f"--- Evaluating at Epoch {epoch_num} ---")
             val_results = evaluate(
@@ -139,10 +178,9 @@ def main():
             # --- 检查性能提升和 Early Stopping ---
             if current_ndcg > best_ndcg:
                 best_ndcg = current_ndcg
-                early_stop_counter = 0 # 重置计数器
+                early_stop_counter = 0 
                 logging.info(f"🚀 New best NDCG on validation: {best_ndcg:.4f} at Epoch {epoch_num}")
 
-                # --- 只有在验证集性能提升时，才评估测试集 ---
                 test_results = evaluate(
                     model,
                     test_loader,
@@ -151,28 +189,23 @@ def main():
                 )
                 logging.info(f"Test Results: {test_results}")
 
-                # 更新最佳结果记录
                 best_epoch = epoch_num
                 best_val_results = val_results
                 best_test_results = test_results
 
-                # 保存最佳模型
                 torch.save(model.state_dict(), config['save_path'])
                 logging.info(f"Best model saved to {config['save_path']}")
             
             else:
-                # 验证集性能没有提升
-                early_stop_counter += eval_interval # <--- 注意：每次检查时增加 interval 的值
+                early_stop_counter += eval_interval 
                 logging.info(f"No improvement since Epoch {best_epoch}. Early stop counter: {early_stop_counter}/{config['training_params']['early_stop'] * eval_interval}")
-                # <--- 修改 Early Stopping 条件：当累计未提升的 epoch 数（考虑了 interval）超过阈值时停止
                 if early_stop_counter >= config['training_params']['early_stop'] * eval_interval:
                     logging.info("Early stopping triggered.")
                     break
         else:
-             # 如果不是评估 epoch，只打印训练损失信息
              logging.info(f"Skipping evaluation for Epoch {epoch_num}.")
 
-    # === 10. 訓練結束總結 ===
+    # === 11. (顺序调整) 訓練結束總結 ===
     logging.info("="*50)
     logging.info("🏁 Training Finished!")
     if best_test_results:

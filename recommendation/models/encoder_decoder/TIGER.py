@@ -1,11 +1,14 @@
 # models/tiger.py (遵守新契约)
 
-from typing import Any, Dict, List
+import imp
+from typing import Any, Dict, List, Optional
 import torch
+import logging
 import transformers
 
 # 明确地从升级后的 abstract_model 导入
 from ..abstract_model import AbstractModel 
+from generation.prefix_tree import Trie
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -18,7 +21,11 @@ T5Config = transformers.T5Config
 # TIGER 现在继承自我们定义好的 ABC
 class TIGER(AbstractModel):
   
-  def __init__(self, config: Dict[str, Any]):
+  def __init__(
+      self, 
+      config: Dict[str, Any], 
+      prefix_trie: Optional[Trie] = None
+  ):
     super().__init__(config)
     # ... (初始化代码完全不变)
     model_params = config['model_params']
@@ -31,6 +38,13 @@ class TIGER(AbstractModel):
     self.t5 = T5ForConditionalGeneration(config=t5config)
     self.t5.resize_token_embeddings(config['token_params']['vocab_size'])
     self.n_params_str = self._calculate_n_parameters() # 在初始化时计算一次
+
+    self.prefix_trie_fn = None
+    if prefix_trie is not None:
+        self.prefix_trie_fn = prefix_trie.get_allowed_next_tokens
+        logger.info("TIGER 模型已成功加载前缀树 (Prefix Trie)。")
+    else:
+        logger.info("TIGER 模型未加载前缀树 (Prefix Trie)。")
 
   @property
   def task_type(self) -> str:
@@ -71,8 +85,18 @@ class TIGER(AbstractModel):
         # 3. 將這個「乾淨」的字典傳遞給 T5 模型
         return self.t5(**t5_inputs)
 
+  # ✅ 关键修改 3: generate 函数注入 prefix_trie_fn
   def generate(self, **kwargs: Any) -> torch.Tensor:
-    """【已实现】执行 T5 的标准生成。"""
+    """
+    【已修改】执行 T5 的标准生成。
+    如果Trie存在，则自动将其注入到 'generate' 的参数中。
+    """
+    
+    # 如果Trie已初始化，则将其 "prefix_allowed_tokens_fn" 添加到kwargs
+    if self.prefix_trie_fn is not None:
+        # 只有在 kwargs 中没有手动提供该函数时才注入
+        kwargs.setdefault('prefix_allowed_tokens_fn', self.prefix_trie_fn)
+        
     return self.t5.generate(**kwargs)
 
   def evaluate_step(self, batch: Dict[str, torch.Tensor], topk_list: List[int]) -> Dict[str, float]:
