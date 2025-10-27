@@ -1,6 +1,6 @@
 python main.py \
   --model_name pq \
-  --dataset_name Toys_and_Games \
+  --dataset_name Beauty \
   --embedding_modality text \
   --embedding_model text-embedding-3-large
 
@@ -8,5 +8,5 @@ python main.py \
 python main.py \
   --model_name rqvae \
   --dataset_name Baby \
-  --embedding_modality fuse \
-  --embedding_model clip-vit-base-patch32
+  --embedding_modality fused \
+  --embedding_model clip-vit-base-patch32-forge512

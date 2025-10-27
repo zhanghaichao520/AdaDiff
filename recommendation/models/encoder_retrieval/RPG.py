@@ -32,7 +32,7 @@ class ResBlock(nn.Module):
     def forward(self, x): return x + self.act(self.linear(x))
 
 class RPG(AbstractModel):
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, **kwargs):
         super().__init__(config)
         self.logger = logging.getLogger(self.__class__.__name__)
         model_params = self.config['model_params']; token_params = self.config['token_params']

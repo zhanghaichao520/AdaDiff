@@ -19,7 +19,7 @@ class GPT2(AbstractModel):
     一個仿照 TIGER 介面的 Decoder-Only 生成式模型。
     它使用 GPT-2 架構從零開始訓練，專用於序列推薦任務。
     """
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], **kwargs):
         super().__init__(config)
         
         model_params = config['model_params']

@@ -1,33 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FORGE-style multimodal fusion with contrastive learning (text/image/fusion) + i2i positives.
+Pure text-image contrastive multimodal fusion (no collaborative/i2i).
 
-相对你的原版增强点：
-1) 仍用同一 CLIP 模型抽取文本/图像嵌入（同空间）；
-2) 新增三路 InfoNCE（text、image、fusion），正样本含：
-   - 同一 item 的 (text, image) 跨模态对齐（CLIP 风格）
-   - i2i 最强共现邻居 (text-text, image-image, fusion-fusion)
-3) 融合：norm 后 concat -> 小型 MLP 投影到 512 维（可学习门控+残差）
-4) 训练完成后，导出融合后的 512 维 emb 到 .npy（可选再做 PCA/whiten）
-5) 仍兼容你原始目录结构；新增可选 i2i 文件支持（若 item.json 里含 related_item 也可自动读）
+做的事：
+1) 用同一 CLIP 模型抽取文本/图像嵌入到同一空间；
+2) 融合头：norm 后 concat -> 门控+残差 MLP -> 512d，并整体 L2；
+3) 训练损失（仅模态相关，不含协同）：
+   - text ↔ image   （双向 InfoNCE）
+   - fusion ↔ text  （单向 InfoNCE）
+   - fusion ↔ image （单向 InfoNCE）
+4) 训练后导出融合 512d 到 .npy；可选 PCA/whiten；
+5) 目录结构与原先保持一致（不再需要 .i2i.json）。
 
-目录假设（兼容你原版）：
-- item2id:        <save_root>/<dataset>/<dataset>.item2id
-- item.json:      <save_root>/<dataset>/<dataset>.item.json   # 文本/sideinfo
-- images_info:    <image_root>/amazon<data_version>/Images/<dataset>_images_info.json
-- image folder:   <image_root>/amazon<data_version>/Images/<dataset>/
-- 可选 i2i:       <save_root>/<dataset>/<dataset>.i2i.json    # { item_id: related_item_id }
-输出：
-- 训练日志与最终 emb: <save_root>/<dataset>/embeddings/<dataset>.emb-fused-<model>-forge512.npy
-- 可选 PCA:       <save_root>/<dataset>/embeddings/<dataset>.emb-fused-<model>-forge512-pca<n>.npy
+输出示例：
+<save_root>/<dataset>/embeddings/<dataset>.emb-fused-<model>-forge512.npy
 """
 
 import os
 import json
-import math
 import argparse
-import random
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
@@ -65,32 +57,20 @@ def get_id2item_dict(item2id_file):
         raise RuntimeError("id2item is empty.")
     return id2item
 
-def l2_normalize_np(x: np.ndarray, eps=1e-12):
-    n = np.linalg.norm(x, axis=1, keepdims=True)
-    return x / (n + eps)
-
-def l2_normalize_t(x: torch.Tensor, eps=1e-12):
-    return x / (x.norm(dim=-1, keepdim=True) + eps)
-
 
 # ----------------- dataset -----------------
 class ItemDataset(Dataset):
     """
-    提供按 id 顺序访问的 item 列表，并可取到：
+    提供按 id 顺序访问的 item：
     - text 字符串
-    - 一个可用图片文件路径（如果没有，返回 None）
-    - i2i 正样本的 index（没有则回退为自身）
+    - 第一张可用图片路径（找不到则用占位黑图）
     """
-    def __init__(self, args, id2item, text_map, image_dir, images_info, i2i_map):
-        self.args = args
+    def __init__(self, id2item, text_map, image_dir, images_info):
         self.idx_list = sorted(id2item.keys(), key=int)  # mapped ids (string)
         self.id2item = id2item
         self.text_map = text_map
         self.image_dir = image_dir
         self.images_info = images_info or {}
-        self.i2i_map = i2i_map or {}
-        # 反向索引：original_item_id -> mapped_id(str)
-        self.item2mapped = {v: k for k, v in id2item.items()}
 
     def __len__(self):
         return len(self.idx_list)
@@ -107,44 +87,26 @@ class ItemDataset(Dataset):
                 return fp
         return None
 
-    def _text_of(self, original_item_id):
-        return self.text_map.get(original_item_id, "N/A")
-
-    def _get_pos_index(self, original_item_id):
-        pos_item = self.i2i_map.get(original_item_id, None)
-        if pos_item and pos_item in self.item2mapped:
-            return self.item2mapped[pos_item]   # mapped id(str)
-        # fallback: self
-        return self.item2mapped.get(original_item_id)
-
     def __getitem__(self, idx):
         mapped_id_str = self.idx_list[idx]
         original_item_id = self.id2item[mapped_id_str]
-
-        # text
-        text = self._text_of(original_item_id)
-
-        # image
+        text = self.text_map.get(original_item_id, "N/A")
         img_path = self._pick_one_image(original_item_id)
-
-        # i2i positive index (mapped string id)
-        pos_mapped_id_str = self._get_pos_index(original_item_id)
         return {
             "mapped_id": mapped_id_str,
             "orig_id": original_item_id,
             "text": text,
             "img_path": img_path,
-            "pos_mapped_id": pos_mapped_id_str,
         }
 
 
 # ----------------- fusion head -----------------
 class GatedFusion(nn.Module):
     """
-    简洁稳定的融合头：
-    [norm(t); norm(i)] -> LN -> Linear(2D->D) -> GELU -> Linear(D->D)  (residual)
+    稳定融合头：
+    [norm(t); norm(i)] -> LN -> Linear(2D->D) -> GELU -> Linear(D->512) (残差)
     + 门控（sigmoid）在 t/i 间做可学习加权
-    最终投影到 out_dim=512
+    输出 L2 归一化的 512 维
     """
     def __init__(self, in_dim, mid_dim, out_dim=512, dropout=0.1):
         super().__init__()
@@ -153,34 +115,30 @@ class GatedFusion(nn.Module):
         self.fc2 = nn.Linear(mid_dim, out_dim)
         self.dropout = nn.Dropout(dropout)
 
-        # 门控：从 concat 输入预测两个权重
         self.gate = nn.Linear(in_dim, 2)
         self.proj_text = nn.Linear(in_dim // 2, out_dim, bias=False)
         self.proj_image = nn.Linear(in_dim // 2, out_dim, bias=False)
 
-        self.res_scale = nn.Parameter(torch.tensor(0.5))  # 残差缩放，稳住训练
+        self.res_scale = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, txt, img):
-        # txt/img 已经是 L2 norm 的同维向量 (B, D)
         x = torch.cat([txt, img], dim=-1)    # (B, 2D)
         x_n = self.ln(x)
         h = self.fc2(F.gelu(self.fc1(x_n)))
         h = self.dropout(h)
 
-        # 门控加权（学习每模态重要性）
-        g = torch.sigmoid(self.gate(x_n))    # (B,2)
+        g = torch.sigmoid(self.gate(x_n))    # (B, 2)
         t_part, i_part = torch.split(x_n, x_n.size(-1)//2, dim=-1)
         t_proj = self.proj_text(t_part)
         i_proj = self.proj_image(i_part)
         gated = g[:, :1]*t_proj + g[:, 1:2]*i_proj
 
-        # 残差融合
         out = gated + self.res_scale * h
-        out = F.normalize(out, dim=-1)       # 最终再 L2 归一化
+        out = F.normalize(out, dim=-1)
         return out
 
 
-# ----------------- training utils -----------------
+# ----------------- encode & losses -----------------
 def clip_encode_text_batch(processor, model, texts, device, max_len):
     inputs = processor(text=texts, return_tensors="pt", padding=True,
                        truncation=True, max_length=max_len).to(device)
@@ -214,23 +172,9 @@ def info_nce_from_pairs(anchor, positive, temperature=0.07):
     labels = torch.arange(anchor.size(0), device=anchor.device)
     return F.cross_entropy(logits, labels)
 
-def batch_index_of(mapped_ids, id2row):
-    # 把 batch 内的 pos_mapped_id（字符串）映射成本批行号，映射不到的回退自身
-    idxs = []
-    B = len(mapped_ids)
-    for i, mid in enumerate(mapped_ids):
-        j = id2row.get(mid, i)
-        idxs.append(j)
-    return torch.tensor(idxs, dtype=torch.long)
 
-def gather_by_index(x, idx):
-    # x: (B,d), idx: (B,) -> (B,d)
-    return x[idx]
-
-
-# ----------------- main training & export -----------------
+# ----------------- builders -----------------
 def build_text_map(args, id2item):
-    # 读 item.json -> 拼 sideinfo 文本
     item_json = os.path.join(args.save_root, args.dataset, f"{args.dataset}.item.json")
     data = load_json(item_json)
     if not isinstance(data, dict):
@@ -243,7 +187,6 @@ def build_text_map(args, id2item):
     else:
         raise ValueError("--dataset_type must be amazon or movielens")
 
-    # 允许把 NER/额外 sideinfo 拼接到文本里
     text_map = {}
     for _, orig_id in id2item.items():
         v = data.get(orig_id, {})
@@ -258,34 +201,10 @@ def build_text_map(args, id2item):
         text_map[orig_id] = text if text.strip() else "N/A"
     return text_map
 
-def build_i2i_map(args, id2item):
-    """
-    i2i 优先级：
-    1) <save_root>/<dataset>/<dataset>.i2i.json  若存在：{ item_id: related_item_id }
-    2) 若 item.json 的条目里有 'related_item' 字段，也会读取
-    3) 不存在则返回空（训练时会回退到自配对）
-    """
-    i2i_path = os.path.join(args.save_root, args.dataset, f"{args.dataset}.i2i.json")
-    i2i = {}
-    if os.path.exists(i2i_path):
-        data = load_json(i2i_path) or {}
-        if isinstance(data, dict):
-            i2i.update({str(k): str(v) for k, v in data.items()})
 
-    # try from item.json if provided
-    item_json = os.path.join(args.save_root, args.dataset, f"{args.dataset}.item.json")
-    meta = load_json(item_json) or {}
-    if isinstance(meta, dict):
-        for orig_id in meta.keys():
-            v = meta.get(orig_id, {})
-            rid = v.get("related_item", None)
-            if isinstance(rid, (str, int)):
-                i2i[str(orig_id)] = str(rid)
-    print(f"[I2I] loaded {len(i2i)} relations.")
-    return i2i
-
-def train_forge_contrastive(args):
-    # 基础路径
+# ----------------- train & export -----------------
+def train_pure_ti(args):
+    # 路径
     processed_data_path = os.path.join(args.save_root, args.dataset)
     item2id_file = os.path.join(processed_data_path, f"{args.dataset}.item2id")
     id2item = get_id2item_dict(item2id_file)
@@ -295,13 +214,12 @@ def train_forge_contrastive(args):
     images_info_path = os.path.join(image_base_path, f"{args.dataset}_images_info.json")
     images_info = load_json(images_info_path) or {}
 
-    # 文本与 i2i
+    # 文本
     text_map = build_text_map(args, id2item)
-    i2i_map = build_i2i_map(args, id2item)
 
     # 模型
     device = torch.device(args.device)
-    processor = CLIPProcessor.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir)
+    processor = CLIPProcessor.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir, use_fast=True)
     clip = CLIPModel.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir).to(device)
     clip.eval()
     if args.freeze_clip:
@@ -309,25 +227,25 @@ def train_forge_contrastive(args):
             p.requires_grad = False
 
     proj_dim = clip.config.projection_dim
-    fusion = GatedFusion(in_dim=proj_dim*2, mid_dim=max(512, proj_dim), out_dim=512, dropout=args.dropout).to(device)
+    fusion = GatedFusion(in_dim=proj_dim*2, mid_dim=max(512, proj_dim),
+                         out_dim=512, dropout=args.dropout).to(device)
 
     # 优化器
     params = list(fusion.parameters())
     if not args.freeze_clip and args.tune_clip_last:
-        # 仅解冻投影头/最后层，谨慎：不同 CLIP 实现层名不同，这里给出范例
         for n, p in clip.named_parameters():
             if any(k in n for k in ["text_projection", "visual_projection"]):
                 p.requires_grad = True
                 params.append(p)
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type=="cuda" and args.amp))
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type=="cuda" and args.amp))
 
     # 数据
-    ds = ItemDataset(args, id2item, text_map, image_dir, images_info, i2i_map)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    ds = ItemDataset(id2item, text_map, image_dir, images_info)
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+                    num_workers=args.num_workers, pin_memory=True, drop_last=True)
 
-    # 训练
-    clip_temperature = args.temperature
+    # 训练（仅模态损失）
     best_loss = float("inf")
     fusion.train()
     for epoch in range(args.epochs):
@@ -336,35 +254,23 @@ def train_forge_contrastive(args):
         for batch in pbar:
             texts = batch["text"]
             img_paths = batch["img_path"]
-            mapped_ids = batch["mapped_id"]  # list of str
-            pos_mapped_ids = batch["pos_mapped_id"]
 
             # 编码
             with torch.no_grad():
-                T = clip_encode_text_batch(processor, clip, texts, device, args.max_sent_len)     # (B, D)
-                I = clip_encode_image_batch(processor, clip, img_paths, device)                   # (B, D)
+                T = clip_encode_text_batch(processor, clip, texts, device, args.max_sent_len)  # (B,D)
+                I = clip_encode_image_batch(processor, clip, img_paths, device)                # (B,D)
 
-            # 融合到 512
-            with torch.cuda.amp.autocast(enabled=(device.type=="cuda" and args.amp)):
-                H = fusion(T, I)   # (B, 512)
+            # 融合
+            with torch.amp.autocast('cuda', enabled=(device.type=="cuda" and args.amp)):
+                H = fusion(T, I)  # (B,512)
 
-                # 1) 跨模态对齐（同一 item 的 text<->image）
-                L_ti = info_nce_from_pairs(T, I, temperature=clip_temperature) \
-                       + info_nce_from_pairs(I, T, temperature=clip_temperature)
+                # 纯模态对齐：text↔image（双向） + fusion↔text + fusion↔image
+                L_ti = info_nce_from_pairs(T, I, temperature=args.temperature) \
+                       + info_nce_from_pairs(I, T, temperature=args.temperature)
+                L_ht = info_nce_from_pairs(H, T, temperature=args.temperature_fusion)
+                L_hi = info_nce_from_pairs(H, I, temperature=args.temperature_fusion)
 
-                # 2) i2i 正样本（text-text, image-image, fusion-fusion）
-                #    构造 batch 内索引映射
-                id2row = {m: i for i, m in enumerate(mapped_ids)}
-                pos_idx = batch_index_of(pos_mapped_ids, id2row).to(device)
-                T_pos = gather_by_index(T, pos_idx)
-                I_pos = gather_by_index(I, pos_idx)
-                H_pos = gather_by_index(H, pos_idx)
-
-                L_tt = info_nce_from_pairs(T, T_pos, temperature=args.temperature_i2i)
-                L_ii = info_nce_from_pairs(I, I_pos, temperature=args.temperature_i2i)
-                L_hh = info_nce_from_pairs(H, H_pos, temperature=args.temperature_i2i)
-
-                loss = args.w_ti * L_ti + args.w_tt * L_tt + args.w_ii * L_ii + args.w_hh * L_hh
+                loss = args.w_ti * L_ti + args.w_ht * L_ht + args.w_hi * L_hi
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -378,28 +284,21 @@ def train_forge_contrastive(args):
         print(f"[E{epoch+1}] loss={avg:.4f}")
         if avg < best_loss:
             best_loss = avg
-            # 只存融合头（足够用）
             ckpt_dir = os.path.join(args.save_root, args.dataset, "embeddings")
             os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save({"fusion": fusion.state_dict()}, os.path.join(ckpt_dir, "fusion_best.pt"))
+            torch.save({"fusion": fusion.state_dict()},
+                       os.path.join(ckpt_dir, "fusion_pure_ti_best.pt"))
 
     # -------- 导出最终 512 维融合向量 --------
     fusion.eval()
-    # 重新顺序遍历，确保导出顺序与 item2id 一致
     sorted_ids = sorted(id2item.keys(), key=int)
+
+    # 准备文本与首图
     texts_all = []
     imgs_all = []
     for mapped_id in sorted_ids:
         orig = id2item[mapped_id]
         texts_all.append(text_map.get(orig, "N/A"))
-
-    # 聚合图像路径
-    image_base_path = os.path.join(args.image_root, f"amazon{args.data_version}", "Images")
-    image_dir = os.path.join(image_base_path, args.dataset)
-    images_info_path = os.path.join(image_base_path, f"{args.dataset}_images_info.json")
-    images_info = load_json(images_info_path) or {}
-    for mapped_id in sorted_ids:
-        orig = id2item[mapped_id]
         # 选第一张可用图
         img = None
         names = images_info.get(orig, [])
@@ -443,7 +342,7 @@ def train_forge_contrastive(args):
 
 # ----------------- argparser -----------------
 def build_parser():
-    ap = argparse.ArgumentParser("FORGE-style multimodal fusion with contrastive learning")
+    ap = argparse.ArgumentParser("Pure text-image contrastive fusion (no collaborative positives)")
     # data
     ap.add_argument("--data_version", type=str, default="14", choices=["14","18"])
     ap.add_argument("--dataset", type=str, required=True)
@@ -454,26 +353,25 @@ def build_parser():
     # model
     ap.add_argument("--model_name_or_path", type=str, default="openai/clip-vit-base-patch32")
     ap.add_argument("--model_cache_dir", type=str, default=None)
-    ap.add_argument("--freeze_clip", action="store_true", help="默认冻结 CLIP，稳定又省算力")
-    ap.add_argument("--tune_clip_last", action="store_true", help="在不冻结时：仅解冻 text/visual_projection 等末端层")
+    ap.add_argument("--freeze_clip", action="store_true", help="默认冻结 CLIP，稳定省算力")
+    ap.add_argument("--tune_clip_last", action="store_true", help="不冻结时：仅解冻投影头等末端层")
     ap.add_argument("--dropout", type=float, default=0.1)
 
     # train
-    ap.add_argument("--epochs", type=int, default=2)
-    ap.add_argument("--batch_size", type=int, default=512)
-    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch_size", type=int, default=1024)
+    ap.add_argument("--num_workers", type=int, default=16)
     ap.add_argument("--max_sent_len", type=int, default=128)
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--amp", action="store_true")
-    ap.add_argument("--temperature", type=float, default=0.07, help="跨模态 text-image 温度")
-    ap.add_argument("--temperature_i2i", type=float, default=0.07, help="i2i 对比温度")
+    ap.add_argument("--temperature", type=float, default=0.07, help="text-image 温度")
+    ap.add_argument("--temperature_fusion", type=float, default=0.07, help="fusion 对齐温度")
 
     # loss weights
-    ap.add_argument("--w_ti", type=float, default=1.0, help="跨模态 text<->image")
-    ap.add_argument("--w_tt", type=float, default=0.5, help="i2i text-text")
-    ap.add_argument("--w_ii", type=float, default=0.5, help="i2i image-image")
-    ap.add_argument("--w_hh", type=float, default=1.0, help="i2i fusion-fusion")
+    ap.add_argument("--w_ti", type=float, default=1.0, help="text<->image (双向)")
+    ap.add_argument("--w_ht", type=float, default=0.5, help="fusion->text")
+    ap.add_argument("--w_hi", type=float, default=0.5, help="fusion->image")
 
     # export
     ap.add_argument("--export_bs", type=int, default=1024)
@@ -488,21 +386,19 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     print(f"[CFG] device={args.device}  model={args.model_name_or_path}")
-    train_forge_contrastive(args)
+    train_pure_ti(args)
 
 
 if __name__ == "__main__":
     """
     例子：
-    python fuse_contrastive_forge.py \
-      --dataset Beauty --dataset_type amazon \
+    python fuse_contrastive_pure_ti.py \
+      --dataset Baby --dataset_type amazon \
       --image_root ../datasets --save_root ../datasets \
-      --model_name_or_path openai/clip-vit-base-patch32 \
-      --freeze_clip --epochs 2 --batch_size 512 --amp \
-      --w_ti 1.0 --w_tt 0.5 --w_ii 0.5 --w_hh 1.0 \
-      --temperature 0.07 --temperature_i2i 0.07 \
+      --model_name_or_path /home/wj/peiyu/LLM_Models/openai-mirror/clip-vit-base-patch32 \
+      --freeze_clip --epochs 4 --batch_size 512 --amp \
+      --w_ti 1.0 --w_ht 0.5 --w_hi 0.5 \
+      --temperature 0.07 --temperature_fusion 0.07 \
       --export_bs 1024 --pca_dim 0
-
-    可选：提供 i2i 文件 ../datasets/Beauty/Beauty.i2i.json （或在 item.json 各条目里给 related_item 字段）
     """
     main()

@@ -21,7 +21,7 @@ class LLM(AbstractModel):
     使用預訓練 Decoder-Only LLM 架構 (如 Llama, Qwen)，但拋棄其原始 Embedding，
     直接使用 Code Token Offset ID 作為輸入，訓練一個新的 Embedding 層。
     """
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], **kwargs):
         super().__init__(config)
         
         model_params = config['model_params']
