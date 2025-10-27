@@ -1,5 +1,5 @@
 python main.py \
-  --model_name mqvae \
+  --model_name pq \
   --dataset_name Toys_and_Games \
   --embedding_modality text \
   --embedding_model text-embedding-3-large
