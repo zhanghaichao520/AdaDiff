@@ -1,3 +1,5 @@
+# preprocessing/generate_embeddings/text_embedding.py
+
 import argparse
 import os
 import random
@@ -160,25 +162,43 @@ def generate_api_embeddings(args, item_text_list):
 
 
 # =============== (共享) PCA 降维 (恢复你原来的逻辑) ===============
+from pathlib import Path
+import joblib  # pip install joblib
+
 def apply_pca_and_save(original_embeddings, args, save_path):
     """
-    应用 PCA 并 *覆盖* 保存到原始路径 (save_path)。
+    对 original_embeddings 做 PCA，并另存为:
+      - <save_path_base>-pca{dim}.npy
+      - <save_path_base>-pca{dim}.pca (joblib 序列化后的 PCA 模型)
+    注：不再覆盖原始 save_path。
     """
     if args.pca_dim <= 0:
         print("跳过 PCA 降维。")
-        return
+        return None
+
+    if original_embeddings.shape[1] < args.pca_dim:
+        print(f"原始维度 ({original_embeddings.shape[1]}) < 目标维度 ({args.pca_dim})，跳过 PCA。")
+        return None
 
     print(f"\n应用 PCA 降维，目标维度: {args.pca_dim}")
-    if original_embeddings.shape[1] < args.pca_dim:
-        print(f"原始维度 ({original_embeddings.shape[1]}) 小于目标维度 ({args.pca_dim})，跳过降维。")
-        return
-
-    pca = PCA(n_components=args.pca_dim)
+    pca = PCA(n_components=args.pca_dim, svd_solver="auto", random_state=42)
     reduced = pca.fit_transform(original_embeddings)
-    print(f"降维后维度: {reduced.shape}，保留方差: {sum(pca.explained_variance_ratio_):.4f}")
+    kept = float(np.sum(pca.explained_variance_ratio_))
 
-    np.save(save_path, reduced) # <--- 覆盖原始文件
-    print(f"✅ PCA 降维后嵌入已保存到: {save_path}")
+    save_path = Path(save_path)
+    base = save_path.with_suffix("")  # 去掉 .npy
+    pca_vec_path = f"{base}-pca{args.pca_dim}.npy"
+    pca_model_path = f"{base}-pca{args.pca_dim}.pca"
+
+    np.save(pca_vec_path, reduced.astype(np.float32))
+    joblib.dump(pca, pca_model_path)
+
+    print(f"✅ 原始嵌入保留: {save_path}")
+    print(f"✅ PCA 向量已保存: {pca_vec_path}  形状={reduced.shape}  保留方差={kept:.4f}")
+    print(f"✅ PCA 模型已保存: {pca_model_path}")
+
+    return reduced
+
 
 
 # =============== (统一) 主程序入口 ===============

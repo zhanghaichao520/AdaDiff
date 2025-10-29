@@ -52,10 +52,11 @@ It unifies data preprocessing, tokenization, generation, and evaluation under a 
 ## ⚙️ Recommendation Architecture
 | Category | Component / Method | Done |
 |-----------|--------------------|--------------|
-| 🧠 Encoder–Decoder | TIGER | ✅ |
+| 🧠 Encoder–Decoder | Sentence T5 | ✅ |
 | 💬 Decoder-Only | GPT2 | ✅ |
 |                 | LLM(Qwen, LLaMA) | ✅ |
 | 🔍 Encoder-Retrieval | RPG | ✅ |
+| 🔍 LLM Instruction Fine Tune | Qwen, LLaMA | - |
 | 🔧 Plugins | Beam Search | - |
 |  | Prefix Tree Constraint | - |
 

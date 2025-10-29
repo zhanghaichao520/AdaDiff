@@ -67,7 +67,7 @@ python generate_embeddings/text_embedding.py \
 python generate_embeddings/text_embedding.py \
   --dataset_type amazon \
   --mode api \
-  --dataset Sports_and_Outdoors \
+  --dataset Baby \
   --sent_emb_model text-embedding-3-large \
   --openai_api_key sk-492a02uVsAauNrYsP4YRW2pvAsELc20hoHJeUh2Sop3GiL3C \
   --openai_base_url https://yunwu.ai/v1 \
@@ -101,6 +101,18 @@ python generate_embeddings/image_embedding.py \
   --model_name_or_path /home/wj/peiyu/LLM_Models/openai-mirror/clip-vit-base-patch32
 ```
 
+### VL融合
+
+ 图像文本一起输入到VLLM
+
+```bash
+python generate_embeddings/vl_embedding.py \
+  --dataset Baby \
+  --vlm_model_name_or_path /home/wj/peiyu/LLM_Models/Qwen/Qwen3-VL-32B-Instruct \
+  --batch_size 64 \
+  --export_tag qwen7b \
+  --pca_dim 512
+```
 ### 协同特征
 
 ```bash

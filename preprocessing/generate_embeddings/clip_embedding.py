@@ -1,20 +1,15 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# preprocessing/generate_embeddings/clip_embedding.py
 """
-Pure text-image contrastive multimodal fusion (no collaborative/i2i).
+多模态融合 V2 - “黄金标准”对齐版
 
-做的事：
-1) 用同一 CLIP 模型抽取文本/图像嵌入到同一空间；
-2) 融合头：norm 后 concat -> 门控+残差 MLP -> 512d，并整体 L2；
-3) 训练损失（仅模态相关，不含协同）：
-   - text ↔ image   （双向 InfoNCE）
-   - fusion ↔ text  （单向 InfoNCE）
-   - fusion ↔ image （单向 InfoNCE）
-4) 训练后导出融合 512d 到 .npy；可选 PCA/whiten；
-5) 目录结构与原先保持一致（不再需要 .i2i.json）。
-
-输出示例：
-<save_root>/<dataset>/embeddings/<dataset>.emb-fused-<model>-forge512.npy
+核心理念：
+1. 假设文本 (T) 是下游任务的“黄金标准”，图像 (I) 是辅助信息。
+2. 融合头 H = Fusion(T, I) 的目标是生成一个“增强版”的 T。
+3. 训练损失（核心修正）：
+   - L(H → T) + L(T → H) (双向 InfoNCE)
+   - 迫使 H 与 T 在同一语义空间对齐。
+   - 融合头被训练去“利用”I 来增强 T，或“忽略”I 来保护 T。
+4. 默认冻结 CLIP，只训练融合头。
 """
 
 import os
@@ -33,7 +28,7 @@ from sklearn.decomposition import PCA
 from transformers import CLIPProcessor, CLIPModel
 
 
-# ----------------- utils -----------------
+# ----------------- utils (保持不变) -----------------
 def load_json(p):
     try:
         with open(p, "r") as f:
@@ -58,13 +53,8 @@ def get_id2item_dict(item2id_file):
     return id2item
 
 
-# ----------------- dataset -----------------
+# ----------------- dataset (保持不变) -----------------
 class ItemDataset(Dataset):
-    """
-    提供按 id 顺序访问的 item：
-    - text 字符串
-    - 第一张可用图片路径（找不到则用占位黑图）
-    """
     def __init__(self, id2item, text_map, image_dir, images_info):
         self.idx_list = sorted(id2item.keys(), key=int)  # mapped ids (string)
         self.id2item = id2item
@@ -100,13 +90,11 @@ class ItemDataset(Dataset):
         }
 
 
-# ----------------- fusion head -----------------
+# ----------------- fusion head (保持不变) -----------------
 class GatedFusion(nn.Module):
     """
-    稳定融合头：
-    [norm(t); norm(i)] -> LN -> Linear(2D->D) -> GELU -> Linear(D->512) (残差)
-    + 门控（sigmoid）在 t/i 间做可学习加权
-    输出 L2 归一化的 512 维
+    您原来的 GatedFusion 融合头 (保持不变)。
+    这个门控结构非常适合我们的新目标，因为它能学会给 T 和 I 动态分配权重。
     """
     def __init__(self, in_dim, mid_dim, out_dim=512, dropout=0.1):
         super().__init__()
@@ -138,15 +126,21 @@ class GatedFusion(nn.Module):
         return out
 
 
-# ----------------- encode & losses -----------------
+# ----------------- encode & losses (保持不变) -----------------
 def clip_encode_text_batch(processor, model, texts, device, max_len):
+    """
+    (保持不变) 
+    我们默认在 no_grad 下运行 (因为 CLIP 处于 eval() 模式)
+    """
     inputs = processor(text=texts, return_tensors="pt", padding=True,
                        truncation=True, max_length=max_len).to(device)
+    # 保持 no_grad，因为我们只训练融合头
     with torch.no_grad():
         f = model.get_text_features(**inputs)
     return F.normalize(f, dim=-1)
 
 def clip_encode_image_batch(processor, model, img_paths, device):
+    """(保持不变)"""
     images = []
     for p in img_paths:
         if p is None:
@@ -157,15 +151,13 @@ def clip_encode_image_batch(processor, model, img_paths, device):
             except (UnidentifiedImageError, FileNotFoundError):
                 images.append(Image.new("RGB", (224, 224), color=(0, 0, 0)))
     inputs = processor(images=images, return_tensors="pt").to(device)
+    # 保持 no_grad，因为我们只训练融合头
     with torch.no_grad():
         f = model.get_image_features(**inputs)
     return F.normalize(f, dim=-1)
 
 def info_nce_from_pairs(anchor, positive, temperature=0.07):
-    """
-    in-batch negatives：anchor (B,d), positive (B,d)
-    logits: diag 为正，其余为负
-    """
+    """(保持不变)"""
     anchor = F.normalize(anchor, dim=-1)
     positive = F.normalize(positive, dim=-1)
     logits = anchor @ positive.t() / temperature
@@ -173,7 +165,7 @@ def info_nce_from_pairs(anchor, positive, temperature=0.07):
     return F.cross_entropy(logits, labels)
 
 
-# ----------------- builders -----------------
+# ----------------- builders (保持不变) -----------------
 def build_text_map(args, id2item):
     item_json = os.path.join(args.save_root, args.dataset, f"{args.dataset}.item.json")
     data = load_json(item_json)
@@ -202,9 +194,9 @@ def build_text_map(args, id2item):
     return text_map
 
 
-# ----------------- train & export -----------------
-def train_pure_ti(args):
-    # 路径
+# ----------------- train & export (核心修改) -----------------
+def train_fusion(args):
+    # 路径 (不变)
     processed_data_path = os.path.join(args.save_root, args.dataset)
     item2id_file = os.path.join(processed_data_path, f"{args.dataset}.item2id")
     id2item = get_id2item_dict(item2id_file)
@@ -214,38 +206,35 @@ def train_pure_ti(args):
     images_info_path = os.path.join(image_base_path, f"{args.dataset}_images_info.json")
     images_info = load_json(images_info_path) or {}
 
-    # 文本
+    # 文本 (不变)
     text_map = build_text_map(args, id2item)
 
-    # 模型
+    # 模型 (不变, 默认冻结)
     device = torch.device(args.device)
     processor = CLIPProcessor.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir, use_fast=True)
     clip = CLIPModel.from_pretrained(args.model_name_or_path, cache_dir=args.model_cache_dir).to(device)
+    
+    # ✅ 关键：始终冻结 CLIP，我们只训练融合头
     clip.eval()
-    if args.freeze_clip:
-        for p in clip.parameters():
-            p.requires_grad = False
+    for p in clip.parameters():
+        p.requires_grad = False
+    print("[INFO] CLIP model is frozen. Only the GatedFusion head will be trained.")
 
     proj_dim = clip.config.projection_dim
     fusion = GatedFusion(in_dim=proj_dim*2, mid_dim=max(512, proj_dim),
                          out_dim=512, dropout=args.dropout).to(device)
 
-    # 优化器
+    # 优化器 (✅ 修正：只优化 fusion 的参数)
     params = list(fusion.parameters())
-    if not args.freeze_clip and args.tune_clip_last:
-        for n, p in clip.named_parameters():
-            if any(k in n for k in ["text_projection", "visual_projection"]):
-                p.requires_grad = True
-                params.append(p)
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type=="cuda" and args.amp))
 
-    # 数据
+    # 数据 (不变)
     ds = ItemDataset(id2item, text_map, image_dir, images_info)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                     num_workers=args.num_workers, pin_memory=True, drop_last=True)
 
-    # 训练（仅模态损失）
+    # 训练（✅ 核心修改：修正损失函数）
     best_loss = float("inf")
     fusion.train()
     for epoch in range(args.epochs):
@@ -255,22 +244,28 @@ def train_pure_ti(args):
             texts = batch["text"]
             img_paths = batch["img_path"]
 
-            # 编码
-            with torch.no_grad():
-                T = clip_encode_text_batch(processor, clip, texts, device, args.max_sent_len)  # (B,D)
-                I = clip_encode_image_batch(processor, clip, img_paths, device)                # (B,D)
+            # 编码 (不变, 在 no_grad 下执行)
+            T = clip_encode_text_batch(processor, clip, texts, device, args.max_sent_len)  # (B,D)
+            I = clip_encode_image_batch(processor, clip, img_paths, device)                # (B,D)
 
-            # 融合
+            # 融合 (需要梯度)
             with torch.amp.autocast('cuda', enabled=(device.type=="cuda" and args.amp)):
                 H = fusion(T, I)  # (B,512)
 
-                # 纯模态对齐：text↔image（双向） + fusion↔text + fusion↔image
-                L_ti = info_nce_from_pairs(T, I, temperature=args.temperature) \
-                       + info_nce_from_pairs(I, T, temperature=args.temperature)
-                L_ht = info_nce_from_pairs(H, T, temperature=args.temperature_fusion)
-                L_hi = info_nce_from_pairs(H, I, temperature=args.temperature_fusion)
+                # ✅ 核心修正：
+                # 训练 H 去对齐 “黄金标准” T。
+                # H 必须学会如何利用 I 来更好地模仿 T。
+                # T.detach() 确保梯度只从 H 流向 Fusion 模块，而不是流向 T。
+                L_ht = info_nce_from_pairs(H, T.detach(), temperature=args.temperature)
+                L_th = info_nce_from_pairs(T.detach(), H, temperature=args.temperature)
 
-                loss = args.w_ti * L_ti + args.w_ht * L_ht + args.w_hi * L_hi
+                loss = L_ht + L_th # (权重默认为 1.0 + 1.0)
+                
+                # ❌ 移除旧的、有问题的损失
+                # L_ti = ...
+                # L_ht = ...
+                # L_hi = ... (这是导致“污染”的项)
+                # loss = ...
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -286,20 +281,30 @@ def train_pure_ti(args):
             best_loss = avg
             ckpt_dir = os.path.join(args.save_root, args.dataset, "embeddings")
             os.makedirs(ckpt_dir, exist_ok=True)
+            # 保存最佳的融合头
             torch.save({"fusion": fusion.state_dict()},
-                       os.path.join(ckpt_dir, "fusion_pure_ti_best.pt"))
+                       os.path.join(ckpt_dir, "fusion_gold_standard_best.pt"))
+            print(f"Saved best fusion head to {ckpt_dir}")
 
-    # -------- 导出最终 512 维融合向量 --------
+    # -------- 导出最终 512 维融合向量 (逻辑不变) --------
+    
+    # ✅ 加载我们训练好的最佳融合头
+    best_ckpt_path = os.path.join(args.save_root, args.dataset, "embeddings", "fusion_gold_standard_best.pt")
+    if os.path.exists(best_ckpt_path):
+        print(f"Loading best fusion head from {best_ckpt_path}")
+        fusion.load_state_dict(torch.load(best_ckpt_path)["fusion"])
+    else:
+        print("[WARN] No best fusion head found. Exporting with the last epoch's weights.")
+
     fusion.eval()
     sorted_ids = sorted(id2item.keys(), key=int)
 
-    # 准备文本与首图
+    # 准备文本与首图 (不变)
     texts_all = []
     imgs_all = []
     for mapped_id in sorted_ids:
         orig = id2item[mapped_id]
         texts_all.append(text_map.get(orig, "N/A"))
-        # 选第一张可用图
         img = None
         names = images_info.get(orig, [])
         if isinstance(names, list):
@@ -321,11 +326,11 @@ def train_pure_ti(args):
             all_feats.append(H.cpu())
     Z = torch.cat(all_feats, dim=0).numpy().astype(np.float32)
 
-    # 可选 PCA/whiten
+    # 导出 (不变)
     out_dir = os.path.join(args.save_root, args.dataset, "embeddings")
     os.makedirs(out_dir, exist_ok=True)
     hf_tag = args.model_name_or_path.split("/")[-1].replace("/", "-")
-    out_base = os.path.join(out_dir, f"{args.dataset}.emb-fused-{hf_tag}-forge512.npy")
+    out_base = os.path.join(out_dir, f"{args.dataset}.emb-fused-{hf_tag}-gold512.npy")
     np.save(out_base, Z)
     print(f"[OK] saved fused 512d: {out_base}  shape={Z.shape}")
 
@@ -333,16 +338,16 @@ def train_pure_ti(args):
         print(f"[INFO] PCA -> {args.pca_dim} (whiten={args.whiten})")
         pca = PCA(n_components=args.pca_dim, whiten=args.whiten, svd_solver="auto", random_state=42)
         Zp = pca.fit_transform(Z).astype(np.float32)
-        out_pca = os.path.join(out_dir, f"{args.dataset}.emb-fused-{hf_tag}-forge512-pca{args.pca_dim}.npy")
+        out_pca = os.path.join(out_dir, f"{args.dataset}.emb-fused-{hf_tag}-gold512-pca{args.pca_dim}.npy")
         np.save(out_pca, Zp)
         print(f"[OK] saved PCA: {out_pca}  shape={Zp.shape}  var={pca.explained_variance_ratio_.sum():.4f}")
 
     return out_base
 
 
-# ----------------- argparser -----------------
+# ----------------- argparser (✅ 修正) -----------------
 def build_parser():
-    ap = argparse.ArgumentParser("Pure text-image contrastive fusion (no collaborative positives)")
+    ap = argparse.ArgumentParser("V2: Gold-Standard Text-Image Fusion")
     # data
     ap.add_argument("--data_version", type=str, default="14", choices=["14","18"])
     ap.add_argument("--dataset", type=str, required=True)
@@ -353,25 +358,20 @@ def build_parser():
     # model
     ap.add_argument("--model_name_or_path", type=str, default="openai/clip-vit-base-patch32")
     ap.add_argument("--model_cache_dir", type=str, default=None)
-    ap.add_argument("--freeze_clip", action="store_true", help="默认冻结 CLIP，稳定省算力")
-    ap.add_argument("--tune_clip_last", action="store_true", help="不冻结时：仅解冻投影头等末端层")
     ap.add_argument("--dropout", type=float, default=0.1)
+    # ✅ 移除了 freeze_clip 和 tune_clip_last，默认冻结
 
     # train
     ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--batch_size", type=int, default=1024)
+    ap.add_argument("--batch_size", type=int, default=4096)
     ap.add_argument("--num_workers", type=int, default=16)
     ap.add_argument("--max_sent_len", type=int, default=128)
-    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--lr", type=float, default=5e-4, help="融合头的学习率")
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--amp", action="store_true")
-    ap.add_argument("--temperature", type=float, default=0.07, help="text-image 温度")
-    ap.add_argument("--temperature_fusion", type=float, default=0.07, help="fusion 对齐温度")
+    ap.add_argument("--temperature", type=float, default=0.07, help="H<->T 对齐温度")
 
-    # loss weights
-    ap.add_argument("--w_ti", type=float, default=1.0, help="text<->image (双向)")
-    ap.add_argument("--w_ht", type=float, default=0.5, help="fusion->text")
-    ap.add_argument("--w_hi", type=float, default=0.5, help="fusion->image")
+    # ✅ 移除了 w_ti, w_ht, w_hi
 
     # export
     ap.add_argument("--export_bs", type=int, default=1024)
@@ -386,19 +386,19 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     print(f"[CFG] device={args.device}  model={args.model_name_or_path}")
-    train_pure_ti(args)
+    print(f"[INFO] Training Philosophy: Gold Standard Alignment (H <-> T)")
+    train_fusion(args)
 
 
 if __name__ == "__main__":
     """
-    例子：
-    python fuse_contrastive_pure_ti.py \
+    例子 (命令不变，但意义已变)：
+    python fuse_gold_standard.py \
       --dataset Baby --dataset_type amazon \
       --image_root ../datasets --save_root ../datasets \
       --model_name_or_path /home/wj/peiyu/LLM_Models/openai-mirror/clip-vit-base-patch32 \
-      --freeze_clip --epochs 4 --batch_size 512 --amp \
-      --w_ti 1.0 --w_ht 0.5 --w_hi 0.5 \
-      --temperature 0.07 --temperature_fusion 0.07 \
+      --epochs 4 --batch_size 512 --amp \
+      --temperature 0.07 \
       --export_bs 1024 --pca_dim 0
     """
     main()

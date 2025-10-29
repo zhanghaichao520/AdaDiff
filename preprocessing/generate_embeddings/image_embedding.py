@@ -1,3 +1,5 @@
+# preprocessing/generate_embeddings/image_embedding.py
+
 import os
 import argparse
 import json
