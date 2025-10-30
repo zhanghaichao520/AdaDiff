@@ -31,15 +31,22 @@ def main():
     parser = argparse.ArgumentParser(description="GenRec Universal Training Pipeline")
     parser.add_argument('--model', type=str, required=True, help='模型名稱 (e.g., TIGER, GPT2, RPG)')
     parser.add_argument('--dataset', type=str, required=True, help='数据集名稱 (e.g., Beauty)')
-    parser.add_argument('--quant_method', type=str, required=True, choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq', 'vqvae'],
-                        help='量化方法')
+    parser.add_argument('--quant_method', type=str, required=True, choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq', 'vqvae', 'mm_rqvae'], help='量化方法')
+    parser.add_argument('--embedding_modality', type=str, default='text', choices=['text', 'image', 'fused', 'lfused'], help='量化模态类型，对应不同的 codebook (默认 text)')
+
     
     # ✅ (已移除) 删除了 --no_trie 命令行参数
     
     args = parser.parse_args()
 
     # === 2. 載入並處理設定檔 ===
-    config = load_and_process_config(args.model, args.dataset, args.quant_method)
+    config = load_and_process_config(
+        args.model, 
+        args.dataset, 
+        args.quant_method,
+        embedding_modality=args.embedding_modality
+    )
+
 
     # === 3. 初始化 (日誌, 隨機種子) ===
     setup_logging(config['log_path'])

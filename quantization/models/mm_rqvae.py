@@ -14,6 +14,24 @@ from .abstract_vq import AbstractVQ
 # ==============================================================================
 #
 
+class GatedFusion(nn.Module):
+    """自适应门控融合，用于多模态晚期融合"""
+    def __init__(self, latent_size):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(latent_size * 2, latent_size),
+            nn.ReLU(),
+            nn.Linear(latent_size, 2),
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, z_T, z_I):
+        # 输出权重 w[:,0]、w[:,1] 分别对应 text/image
+        w = self.gate(torch.cat([z_T, z_I], dim=-1))
+        z_fused = w[:, 0:1] * z_T + w[:, 1:2] * z_I
+        return z_fused, w
+
+
 class MLP(nn.Module):
     def __init__(self, input_size, hidden_sizes, latent_size, dropout=0.0):
         super(MLP, self).__init__()
@@ -354,6 +372,8 @@ class MM_RQVAE(AbstractVQ):
         # (新增) 两个独立的编码器
         self.encoder_T = MLP(input_size_text, hidden_sizes, latent_size, dropout=dropout)
         self.encoder_I = MLP(input_size_image, hidden_sizes, latent_size, dropout=dropout)
+        self.fusion = GatedFusion(latent_size)
+
         
         # (新增) 两个独立的解码器
         rev_hidden_sizes = hidden_sizes.copy()
@@ -396,16 +416,27 @@ class MM_RQVAE(AbstractVQ):
 
     def encode(self, xs_T, xs_I):
         """
-        (修改) 编码器步骤：分别编码并融合
+        (增强版) 编码阶段：
+        - 分别编码两模态
+        - 归一化
+        - 门控融合
+        - 加噪声稳定化
         """
         z_T = self.encoder_T(xs_T)
         z_I = self.encoder_I(xs_I)
         
-        # 融合策略：元素相加 (Element-wise Sum)
-        # 这会迫使两个编码器学习对齐的潜在空间
-        z_fused = z_T + z_I
+        # LayerNorm + tanh 归一化
+        z_T = torch.tanh(F.layer_norm(z_T, z_T.shape[-1:]))
+        z_I = torch.tanh(F.layer_norm(z_I, z_I.shape[-1:]))
+
+        # 门控融合（自适应加权）
+        z_fused, weights = self.fusion(z_T, z_I)
+        
+        # 防止 collapse：加入轻微噪声扰动
+        z_fused = z_fused + 0.01 * torch.randn_like(z_fused)
         
         return z_fused
+
 
     def decode(self, z_q):
         """
@@ -426,45 +457,66 @@ class MM_RQVAE(AbstractVQ):
 
     def compute_loss(self, forward_outputs, **kwargs):
         """
-        (修改) 计算多模态损失
-        
-        Args:
-            forward_outputs: self.forward() 的输出
-            **kwargs: 必须包含 'xs_T' 和 'xs_I'
-            
-        Returns:
-            dict: 包含 'loss_total' 和其他子损失的字典
+        (增强版) 多模态损失计算：
+        - 模态重建损失
+        - 量化损失
+        - 一致性对齐损失 (z_T vs z_I)
         """
-        # 1. 解析输入
         xs_T = kwargs.get('xs_T')
         xs_I = kwargs.get('xs_I')
         if xs_T is None or xs_I is None:
-            raise ValueError("MM_RQVAE compute_loss 必须接收 'xs_T' 和 'xs_I' 作为 kwargs")
+            raise ValueError("MM_RQVAE compute_loss 必须接收 'xs_T' 和 'xs_I'")
 
         (out_T, out_I), quant_loss, code = forward_outputs
         
-        # 2. 计算重建损失 (L1或L2)
+        # 重建损失
         loss_fn = F.mse_loss if self.loss_type == "mse" else F.l1_loss
-        
         loss_recon_T = loss_fn(out_T, xs_T, reduction="mean")
         loss_recon_I = loss_fn(out_I, xs_I, reduction="mean")
-        
-        # 3. 加权合并重建损失
         loss_recon = (self.w_recon_T * loss_recon_T) + (self.w_recon_I * loss_recon_I)
+        
+        # ============================================================
+        # 🔁 InfoNCE 式跨模态对齐（对称双向）
+        # ============================================================
+        z_T = self.encoder_T(xs_T)
+        z_I = self.encoder_I(xs_I)
 
-        # 4. 量化损失
-        loss_latent = quant_loss
+        # 归一化 latent 表示
+        z_T_norm = F.normalize(z_T, dim=-1)
+        z_I_norm = F.normalize(z_I, dim=-1)
 
-        # 5. 总损失
-        loss_total = loss_recon + self.latent_loss_weight * loss_latent
+        # 计算相似度矩阵 (B x B)
+        logits_T2I = torch.matmul(z_T_norm, z_I_norm.T) / 0.07
+        logits_I2T = logits_T2I.T  # 对称方向
+
+        # 正样本索引
+        labels = torch.arange(logits_T2I.size(0), device=z_T.device)
+
+        # 双向 InfoNCE
+        loss_T2I = F.cross_entropy(logits_T2I, labels)
+        loss_I2T = F.cross_entropy(logits_I2T, labels)
+        loss_align = 0.5 * (loss_T2I + loss_I2T)
+
+        # （可选）引入分布正则项：防止塌陷
+        sim_reg = (1 - torch.diag(logits_T2I).mean()) ** 2
+        loss_align = loss_align + 0.01 * sim_reg
+
+        # 总损失
+        loss_total = (
+            loss_recon
+            + self.latent_loss_weight * quant_loss
+            + 0.1 * loss_align
+        )
 
         return {
             "loss_total": loss_total,
             "loss_recon": loss_recon,
-            "loss_latent": loss_latent,
-            "loss_recon_T": loss_recon_T, # (用于日志)
-            "loss_recon_I": loss_recon_I, # (用于日志)
+            "loss_latent": quant_loss,
+            "loss_recon_T": loss_recon_T,
+            "loss_recon_I": loss_recon_I,
+            "loss_align": loss_align,
         }
+
 
     @property
     def is_iterative(self) -> bool:

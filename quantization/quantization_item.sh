@@ -1,8 +1,8 @@
 python main.py \
   --model_name rqvae \
   --dataset_name Baby \
-  --embedding_modality text \
-  --embedding_model qwen7b-Qwen3-VL-32B-Instruct-pca512
+  --embedding_modality fused \
+  --embedding_model text-embedding-3-large-clip-vit-base-patch32
 
 # 多模态
 python main.py \

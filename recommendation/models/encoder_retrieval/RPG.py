@@ -232,38 +232,73 @@ class RPG(AbstractModel):
         # --- 2. GPT-2 ---
         outputs = self.gpt2(inputs_embeds=input_embs, attention_mask=attention_mask)
         
-        # --- 3. 獲取 *最後* 的隱藏狀態 ---
-        seq_lens = attention_mask.sum(dim=1); valid_lens = torch.clamp(seq_lens - 1, min=0)
+        # --- 3. 获取 *最后* 的隐藏状态（保持不变） ---
+        seq_lens = attention_mask.sum(dim=1)
+        valid_lens = torch.clamp(seq_lens - 1, min=0)
         max_seq_len_in_batch = outputs.last_hidden_state.shape[1]
         valid_lens = torch.min(valid_lens, torch.tensor(max_seq_len_in_batch - 1, device=current_device))
-        last_hidden_states = outputs.last_hidden_state[torch.arange(batch_size, device=current_device), valid_lens] # (B, D)
-        
-        # --- 4. 應用 Heads 到 *最後* 狀態 ---
-        final_states = [head(last_hidden_states) for head in self.pred_heads]; final_states = torch.stack(final_states, dim=1); # (B, L_code, D)
-        final_states = F.normalize(final_states, dim=-1) # (B, L_code, D)
-        
-        # --- 5. 檢索 (計算與 *所有* item 的相似度) ---
-        # 獲取所有 item 的 code token embeddings
-        # 注意: 這裡 item_id2tokens[0] 是 padding，我們不應該用它來計算相似度
-        # 我們假設 all_item_embs[0] 是 padding, all_item_embs[1] 是 item_id=1, ...
-        all_item_codes = self.item_id2tokens[1:] # (N_items, L_code)
-        all_item_embs = self.gpt2.wte(all_item_codes) # (N_items, L_code, D)
-        all_item_embs = F.normalize(all_item_embs, dim=-1) # (N_items, L_code, D)
-        
-        # 計算 User (B, L_code, D) 和 Items (N_items, L_code, D) 之間的點積
-        # (B, L_code, D) @ (N_items, L_code, D).transpose(1, 2) -> (B, L_code, N_items, D) ? No
-        # 我們需要 (B, N_items)
-        # einsum 'bld,ild->bi' 
-        # b=batch_size, l=L_code, d=Dim
-        # i=N_items
-        item_scores = torch.einsum('bld,ild->bi', final_states, all_item_embs) # (B, N_items)
-        
-        # 獲取 TopK
-        _, topk_indices = torch.topk(item_scores, k=topk, dim=1) # (B, k)
-        
-        # topk_indices 是 0-based (0..N_items-1)，對應 item_id 1..N_items
-        # 所以我們需要 +1 讓它變回 1-based item IDs
-        return topk_indices + 1 # (B, k), 1-based Item IDs
+        last_hidden_states = outputs.last_hidden_state[torch.arange(batch_size, device=current_device), valid_lens]  # (B, D)
+
+        # --- 4. 应用 Heads 到 *最后* 状态（与训练一致） ---
+        final_states = [head(last_hidden_states) for head in self.pred_heads]  # list of (B, D)
+        final_states = torch.stack(final_states, dim=1)  # (B, L_code, D)
+        final_states = F.normalize(final_states, dim=-1)
+
+        # --- 5. 预取 token embedding，并按 codebook 分段 ---
+        token_emb = self.gpt2.wte.weight  # (V, D)
+        token_emb = F.normalize(token_emb, dim=-1)
+
+        bases = torch.tensor(self.config['bases'], device=current_device)
+        vocab_sizes = torch.tensor(self.config['vocab_sizes'], device=current_device)
+        assert self.n_pred_head == len(vocab_sizes), "n_pred_head 与 vocab_sizes 长度不一致"
+
+        all_same = bool(torch.all(vocab_sizes == vocab_sizes[0]).item())
+        token_embs_per_digit = []
+        if all_same and len(vocab_sizes) == self.n_pred_head:
+            K = int(vocab_sizes[0].item())
+            start = 1  # 跳过 padding 0
+            end = start + self.n_pred_head * K
+            assert end <= token_emb.shape[0], "token_emb 词表不足以切成等长分块"
+            chunked = torch.chunk(token_emb[start:end], self.n_pred_head, dim=0)
+            token_embs_per_digit = list(chunked)  # 每个 (K, D)
+        else:
+            for i in range(self.n_pred_head):
+                s = int(bases[i].item()) + 1
+                e = s + int(vocab_sizes[i].item())
+                assert e <= token_emb.shape[0], f"digit {i} 的 vocab 切片越界: [{s},{e})"
+                token_embs_per_digit.append(token_emb[s:e])  # (K_i, D)
+
+        # --- 6. 计算每位 digit 的 log_softmax 概率（与训练一致） ---
+        log_probs_per_digit = []
+        for i in range(self.n_pred_head):
+            logits_i = torch.matmul(final_states[:, i, :], token_embs_per_digit[i].T) / self.temperature  # (B, K_i)
+            log_probs_per_digit.append(F.log_softmax(logits_i, dim=-1))  # (B, K_i)
+
+        # --- 7. 按 item 的每位 token 索引 gather 出 log_prob 并求和，得到 item 分数 ---
+        all_item_codes = self.item_id2tokens[1:]  # (N_items, L_code) 1-based 全局 token id
+        per_digit_indices = []
+        for i in range(self.n_pred_head):
+            if all_same:
+                K = int(vocab_sizes[0].item())
+                base_i = i * K
+                idx_i = all_item_codes[:, i] - base_i - 1  # (N_items,)
+            else:
+                base_i = int(bases[i].item())
+                idx_i = all_item_codes[:, i] - base_i - 1
+            assert torch.all((idx_i >= 0) & (idx_i < log_probs_per_digit[i].shape[1])), f"digit {i} 索引越界"
+            per_digit_indices.append(idx_i)
+
+        item_scores = None
+        for i in range(self.n_pred_head):
+            lp = log_probs_per_digit[i]  # (B, K_i)
+            idx = per_digit_indices[i].unsqueeze(0).expand(batch_size, -1)  # (B, N_items)
+            gathered = torch.gather(lp, dim=1, index=idx)  # (B, N_items)
+            item_scores = gathered if item_scores is None else (item_scores + gathered)
+
+        # --- 8. 取 TopK（注意 item_id 要 +1 还原 1-based） ---
+        _, topk_indices = torch.topk(item_scores, k=topk, dim=1)  # (B, k)
+        return topk_indices + 1
+
 
     # ==================== EVALUATE (核心修正) ====================
     def evaluate_step(self, batch: Dict, topk_list: List[int]) -> Dict[str, float]:

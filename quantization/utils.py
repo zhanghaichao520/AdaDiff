@@ -205,34 +205,28 @@ def set_weight_decay(optimizer, weight_decay):
 
 def build_codebook_path(codebook_base_path: str, dataset_name: str, 
                         model_name: str, 
-                        # ✅ 修改：接收 text 和 image 模型名称
                         text_embedding_model: str = None, 
                         image_embedding_model: str = None, 
-                        # ✅ 修改：单模态时使用 embedding_model
                         embedding_model: str = None,
                         embedding_modality: str = None) -> str:
     """
-    生成码本路径 (支持单模态和多模态，包含来源模型)。
+    构建码本路径（不再包含具体 embedding 模型名，仅保留模态和模型类型）
+    例如：
+        单模态: Baby.fused.rqvae.npy
+        多模态: Baby.text+image.mm_rqvae.npy
     """
     ds = str(dataset_name)
     model_tag = str(model_name).lower()
     dir_path = os.path.join(codebook_base_path, ds, "codebooks")
     os.makedirs(dir_path, exist_ok=True) 
 
-    filename = "" # 初始化
-
+    # --- 多模态情况 ---
     if model_tag == 'mm_rqvae':
-        # 多模态文件名: {dataset}.{text_model}+{image_model}.mm_rqvae.codebook.npy
-        if not text_embedding_model or not image_embedding_model:
-             raise ValueError("MM_RQVAE 需要 text_embedding_model 和 image_embedding_model 来构建码本路径")
-        emb_tag = f"{text_embedding_model}+{image_embedding_model}"
-        filename = f"{ds}.{emb_tag}.{model_tag}.codebook.npy"
+        filename = f"{ds}.lfused.{model_tag}.npy"
+
+    # --- 单模态情况 ---
     else:
-        # 单模态文件名: {dataset}.{emb_model}.{modality}.{model_tag}.codebook.npy
-        if not embedding_model:
-             raise ValueError("单模态需要 embedding_model 来构建码本路径")
-        emb_tag = str(embedding_model)
-        mod_tag = str(embedding_modality).lower() if embedding_modality else 'text' # 默认 text
-        filename = f"{ds}.{emb_tag}.{mod_tag}.{model_tag}.codebook.npy"
-        
+        mod_tag = str(embedding_modality).lower() if embedding_modality else 'text'
+        filename = f"{ds}.{mod_tag}.{model_tag}.npy"
+
     return os.path.join(dir_path, filename)
