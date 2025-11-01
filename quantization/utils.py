@@ -1,85 +1,117 @@
-import json
-import os
-import pickle
-import importlib
-import numpy as np
-import torch
-import torch.nn.functional as F
-import yaml
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from tqdm import trange
-import sys
-
-# quantizers/utils.py
+# /quantization/utils.py
 
 import os
+import sys 
 import logging
+import importlib 
 from datetime import datetime
 from collections import defaultdict
 import numpy as np
 
 def get_model(model_name: str):
     """
-    为平级结构设计的模型工厂函数。
-    它会从 models/{model_name}.py 文件中加载模型类。
-    
-    Args:
-        model_name (str): 模型名称 (例如 'rqvae')，来自命令行参数。
-
-    Returns:
-        torch.nn.Module: 加载到的模型类 (例如 RQVAE class)。
+    模型工厂函数，支持 MM_RQVAE。
     """
     try:
-        # 1. 动态构建模块路径，例如 'models.rqvae'
         module_path = f'models.{model_name}'
-        
-        # 2. 导入这个具体的模块 (即 models/rqvae.py 文件)
         model_module = importlib.import_module(module_path)
         
-        # 3. 约定类名为模型名的大写形式，例如 'RQVAE'
         class_name = model_name.upper()
+        if model_name.lower() == 'mm_rqvae':
+             class_name = 'MM_RQVAE' # 确保匹配您文件中的类名
+             
         model_class = getattr(model_module, class_name)
         
     except (ImportError, AttributeError) as e:
-        # 如果找不到模块或类，给出清晰的错误提示
         print(f"ERROR: 尝试加载模型 '{model_name}' 时失败。 异常: {e}")
+        class_name_upper = model_name.upper() 
+        if model_name.lower() == 'mm_rqvae': class_name_upper = 'MM_RQVAE'
+        
         raise ValueError(
             f'Model "{model_name}" not found. '
-            f'请检查以下几点：\n'
-            f'1. 在 "models/" 文件夹中是否存在一个名为 "{model_name}.py" 的文件。\n'
-            f'2. 在该文件中，是否定义了一个名为 "{class_name}" 的类。'
+            f'请检查:\n'
+            f'1. "models/" 中是否存在 "{model_name}.py"。\n'
+            f'2. 该文件中是否定义了类 "{class_name_upper}"。'
         )
         
     return model_class
     
 def setup_paths(args):
-    """根据输入参数构建所有需要的路径（新版兼容模态+模型）"""
+    """根据输入参数构建路径 (自动处理单模态和多模态)"""
     emb_dir = os.path.join(args.data_base_path, args.dataset_name, "embeddings")
     os.makedirs(emb_dir, exist_ok=True)
 
-    # ✅ 统一 embedding 文件命名规范
-    embedding_filename = f"{args.dataset_name}.emb-{args.embedding_modality}-{args.embedding_model}.npy"
-    embedding_path = os.path.join(emb_dir, embedding_filename)
+    is_multimodal = args.model_name.lower() == 'mm_rqvae'
+    embedding_path = None 
+    output_base_dir = "" 
 
-    # ✅ 输出目录：包含量化器和embedding来源，确保隔离
-    output_base_dir = f"{args.model_name}/{args.embedding_modality}-{args.embedding_model}"
+    if is_multimodal:
+        # --- 多模态路径逻辑 ---
+        print("[INFO] 检测到 MM_RQVAE，将根据 text/image embedding model 名称查找文件...")
+        
+        # 检查必需的参数
+        if not args.text_embedding_model or not args.image_embedding_model:
+            raise ValueError("错误：当使用 '--model_name mm_rqvae' 时，必须同时提供 '--text_embedding_model' 和 '--image_embedding_model' 参数。")
+
+        text_modality_name = 'text'
+        image_modality_name = 'image' # 或者 'fused'，取决于您的文件名约定
+        
+        # 使用指定的模型名称构建路径
+        embedding_filename_T = f"{args.dataset_name}.emb-{text_modality_name}-{args.text_embedding_model}.npy"
+        embedding_path_T = os.path.join(emb_dir, embedding_filename_T)
+        
+        embedding_filename_I = f"{args.dataset_name}.emb-{image_modality_name}-{args.image_embedding_model}.npy"
+        # 尝试 fused 命名（如果 image 不存在）
+        embedding_path_I_alt = os.path.join(emb_dir, f"{args.dataset_name}.emb-fused-{args.image_embedding_model}.npy")
+        embedding_path_I = os.path.join(emb_dir, embedding_filename_I)
+        
+        # 检查图像/融合文件是否存在
+        if not os.path.exists(embedding_path_I):
+             if os.path.exists(embedding_path_I_alt):
+                  embedding_path_I = embedding_path_I_alt
+                  print(f"[INFO] 未找到 'emb-image-...', 使用 'emb-fused-...': {embedding_path_I}")
+             # else: 留下原始路径，让后面的加载逻辑报错
+
+        # 返回路径元组
+        embedding_path = (embedding_path_T, embedding_path_I)
+        
+        # 输出目录：包含两个来源模型，更清晰
+        output_base_dir = f"{args.model_name}/{args.text_embedding_model}+{args.image_embedding_model}" 
+
+    else:
+        # --- 单模态路径逻辑 ---
+        if not args.embedding_modality:
+             print("[WARN] 未指定 embedding_modality，默认为 'text'。")
+             args.embedding_modality = 'text'
+        if not args.embedding_model:
+             raise ValueError("错误：对于单模态模型，必须提供 '--embedding_model' 参数。")
+             
+        embedding_filename = f"{args.dataset_name}.emb-{args.embedding_modality}-{args.embedding_model}.npy"
+        embedding_path = os.path.join(emb_dir, embedding_filename)
+        
+        # 输出目录
+        output_base_dir = f"{args.model_name}/{args.embedding_modality}-{args.embedding_model}"
+
+    # --- 共享的输出路径构建 ---
     log_dir = os.path.join(args.log_base_path, args.dataset_name, output_base_dir)
     ckpt_dir = os.path.join(args.ckpt_base_path, args.dataset_name, output_base_dir)
-    codebook_dir = os.path.join(args.codebook_base_path, args.dataset_name, "codebooks")
+    codebook_base_dir = os.path.join(args.codebook_base_path, args.dataset_name, "codebooks")
 
-    for d in [log_dir, ckpt_dir, codebook_dir]:
+    for d in [log_dir, ckpt_dir, codebook_base_dir]:
         os.makedirs(d, exist_ok=True)
 
     print("--- 自动构建路径 ---")
-    print(f"输入嵌入文件: {embedding_path}")
+    if is_multimodal:
+        print(f"输入嵌入 (Text): {embedding_path[0]}")
+        print(f"输入嵌入 (Image/Fused): {embedding_path[1]}")
+    else:
+        print(f"输入嵌入文件: {embedding_path}")
     print(f"日志目录: {log_dir}")
     print(f"模型目录: {ckpt_dir}")
-    print(f"码本目录: {codebook_dir}")
+    print(f"码本根目录: {codebook_base_dir}")
     print("------------------------------------\n")
 
-    return embedding_path, log_dir, ckpt_dir, codebook_dir
-
+    return embedding_path, log_dir, ckpt_dir, codebook_base_dir
 
 def setup_logging(log_dir):
     """配置日志记录器"""
@@ -171,16 +203,30 @@ def set_weight_decay(optimizer, weight_decay):
     for param_group in optimizer.param_groups:
         param_group["weight_decay"] = weight_decay
 
-def build_codebook_path(codebook_base_path: str, dataset_name: str, model_name: str) -> str:
+def build_codebook_path(codebook_base_path: str, dataset_name: str, 
+                        model_name: str, 
+                        text_embedding_model: str = None, 
+                        image_embedding_model: str = None, 
+                        embedding_model: str = None,
+                        embedding_modality: str = None) -> str:
     """
-    生成码本保存/读取的规范路径:
-      {codebook_base_path}/{dataset_name}/{dataset_name}.{model_name.lower()}.codebook.npy
-    例如:
-      ../datasets/Beauty/Beauty.rqvae.codebook.npy
+    构建码本路径（不再包含具体 embedding 模型名，仅保留模态和模型类型）
+    例如：
+        单模态: Baby.fused.rqvae.npy
+        多模态: Baby.text+image.mm_rqvae.npy
     """
     ds = str(dataset_name)
     model_tag = str(model_name).lower()
-    dir_path = os.path.join(codebook_base_path, ds)
-    os.makedirs(dir_path, exist_ok=True)
-    filename = f"{ds}.{model_tag}.codebook.npy"
+    dir_path = os.path.join(codebook_base_path, ds, "codebooks")
+    os.makedirs(dir_path, exist_ok=True) 
+
+    # --- 多模态情况 ---
+    if model_tag == 'mm_rqvae':
+        filename = f"{ds}.lfused.{model_tag}.npy"
+
+    # --- 单模态情况 ---
+    else:
+        mod_tag = str(embedding_modality).lower() if embedding_modality else 'text'
+        filename = f"{ds}.{mod_tag}.{model_tag}.npy"
+
     return os.path.join(dir_path, filename)

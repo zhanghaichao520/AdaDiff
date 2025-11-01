@@ -12,7 +12,7 @@ from pathlib import Path
 import importlib
 from collections.abc import Mapping
 
-VALID_QUANT_METHODS = {"rkmeans", "rvq", "rqvae", "opq", "pq", 'vqvae'}
+VALID_QUANT_METHODS = {"rkmeans", "rvq", "rqvae", "opq", "pq", 'vqvae', 'mm_rqvae'}
 
 def _ensure_dir_exists(dir_path: Path):
     """确保目录存在"""
@@ -54,7 +54,7 @@ def _load_quant_details(path: str, quant_method: str) -> dict:
     return mp
 
 
-def load_and_process_config(model_name: str, dataset_name: str, quant_method: str) -> dict:
+def load_and_process_config(model_name: str, dataset_name: str, quant_method: str, embedding_modality: str = 'text') -> dict:
     """
     通用配置加载器 (V6 - 支援 base.yaml 繼承與覆蓋)。
     """
@@ -81,6 +81,7 @@ def load_and_process_config(model_name: str, dataset_name: str, quant_method: st
     config['model_name'] = model_name
     config['dataset_name'] = dataset_name
     config['quant_method'] = quant_method.lower()
+    config['embedding_modality'] = embedding_modality.lower()
     
     if config['quant_method'] not in VALID_QUANT_METHODS:
         raise ValueError(f"不支持的量化方法: {quant_method}。可选: {VALID_QUANT_METHODS}")
@@ -102,7 +103,26 @@ def load_and_process_config(model_name: str, dataset_name: str, quant_method: st
     dataset_root = Path(paths['dataset_root'].format(**format_args))
     output_root = Path(paths['output_root'].format(**format_args))
 
-    config['code_path'] = paths['codebook_template'].format(dataset_root=dataset_root, **format_args)
+        # === 4. 自动构造 codebook 路径 ===
+    dataset_root = Path(f"../datasets/{dataset_name}")
+    codebook_dir = dataset_root / "codebooks"
+
+    mod_tag = embedding_modality.lower()
+    quant_tag = config['quant_method'].lower()
+
+    # 严格匹配指定模态和量化方法
+    codebook_path = codebook_dir / f"{dataset_name}.{mod_tag}.{quant_tag}.npy"
+
+    if not codebook_path.exists():
+        raise FileNotFoundError(
+            f"[FATAL] 未找到指定模态 '{mod_tag}' 的 codebook 文件！\n"
+            f"期望路径: {codebook_path}\n"
+            f"请确认路径及文件名与保存时一致。"
+        )
+
+    config['code_path'] = str(codebook_path)
+    logging.info(f"📦 [Config] 成功加载 Codebook: {config['code_path']}")
+
     config['log_path'] = output_root / "training.log"
     config['save_path'] = output_root / "best_model.pth"
     config['train_json'] = dataset_root / f"{dataset_name}.train.jsonl"
