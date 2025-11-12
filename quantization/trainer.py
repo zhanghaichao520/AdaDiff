@@ -141,7 +141,8 @@ class Trainer:
                     batch_xs = batch[0].to(self.device) 
                     outputs = self.model(xs=batch_xs)
                     # 确保 compute_loss 接收正确的参数名 (xs)
-                    loss_dict = self.model.compute_loss(outputs, xs=batch_xs) 
+                    loss_dict = self.model.compute_loss(outputs, batch_data=batch_xs)
+
                 
                 loss_total = loss_dict.get("loss_total", torch.tensor(0.0, device=self.device))
 
@@ -175,7 +176,8 @@ class Trainer:
                         else:
                             batch_xs = batch[0].to(self.device)
                             outputs = self.model(xs=batch_xs)
-                            val_loss_dict = self.model.compute_loss(outputs, xs=batch_xs)
+                            val_loss_dict = self.model.compute_loss(outputs, batch_data=batch_xs)
+
                             
                         loss_val = val_loss_dict.get('loss_total', torch.tensor(0.0, device=self.device))
                         val_loss_sum += loss_val.item() if isinstance(loss_val, torch.Tensor) else float(loss_val)
