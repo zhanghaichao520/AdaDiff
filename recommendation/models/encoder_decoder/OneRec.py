@@ -1,15 +1,16 @@
-# models/OneRec.py - 基于OneRec-Think的统一对话、推理和推荐框架
+# models/OneRec.py - OneRec-style session-wise generative recommender (MoE-T5)
+
+import logging
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Any, Dict, List, Optional
-import logging
-import transformers
-from transformers import T5ForConditionalGeneration, T5Config
+from transformers import T5Config, T5ForConditionalGeneration
 
 import sys
 from pathlib import Path
+
 root = Path(__file__).resolve().parents[3]
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
@@ -21,182 +22,229 @@ from recommendation.models.abstract_model import AbstractModel
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------
+#  Simple MoE FFN for Decoder
+# ------------------------------
+class SimpleFFN(nn.Module):
+    """A simple T5-like FFN block: Linear -> GELU -> Dropout -> Linear"""
+
+    def __init__(self, d_model: int, d_ff: int, dropout: float):
+        super().__init__()
+        self.wi = nn.Linear(d_model, d_ff)
+        self.wo = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.GELU()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states: (B, S, D)
+        x = self.wi(hidden_states)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.wo(x)
+        return x
+
+
+class MoEFFN(nn.Module):
+    """
+    Soft Mixture-of-Experts FFN (dense MoE，架构版，不搞极致加速)
+    - Inputs:  (B, S, D)
+    - Outputs: (B, S, D)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        num_experts: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [SimpleFFN(d_model, d_ff, dropout) for _ in range(num_experts)]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states: (B, S, D)
+        B, S, D = hidden_states.shape
+
+        # (B, S, E)
+        gate_logits = self.gate(hidden_states)
+        gate_probs = F.softmax(gate_logits, dim=-1)
+
+        # 每个 expert 看到同一批 token（dense MoE）
+        expert_outputs = []
+        for expert in self.experts:
+            y = expert(hidden_states)  # (B, S, D)
+            expert_outputs.append(y)
+
+        # (B, S, E, D)
+        expert_stack = torch.stack(expert_outputs, dim=2)
+        gate_probs = gate_probs.unsqueeze(-1)  # (B, S, E, 1)
+
+        # (B, S, D)
+        output = torch.sum(expert_stack * gate_probs, dim=2)
+        return output
+
+
+# ------------------------------
+#        OneRec main model
+# ------------------------------
 class OneRec(AbstractModel):
     """
-    OneRec-Think: 统一对话、推理和个性化推荐框架
-    
-    核心特性:
-    1. 分层项目token对齐 (Hierarchical Itemic Token Alignment)
-    2. 推理激活 (Reasoning Activation via CoT)
-    3. 强化学习推理优化 (Reinforcement-based Reasoning Refinement)
-    4. 编码器-解码器架构与交叉注意力
-    5. 优化的生成策略
+    OneRec-style session-wise generative recommender (architecture version)
+
+    核心特性：
+    - T5 encoder-decoder backbone
+    - Decoder FFN 替换为 MoE（类似 OneRec 中的 MoE 解码器）
+    - Prefix Trie 约束生成（只允许合法 SID 序列）
+    - Beam search 生成 session-wise 目标 code sequence
     """
-    
+
     def __init__(
-        self, 
-        config: Dict[str, Any], 
-        prefix_trie: Optional[Trie] = None
+        self,
+        config: Dict[str, Any],
+        prefix_trie: Optional[Trie] = None,
     ):
         super().__init__(config)
-        
-        # 获取配置参数
-        model_params = config['model_params']
-        token_params = config['token_params']
-        
-        # 构建T5配置
+
+        self.cfg = config               # 实验 / 训练配置（字典）
+        model_params = config["model_params"]
+        token_params = config["token_params"]
+
+        # -------- 1. 构建 T5 配置 --------
         t5_config = T5Config(
-            vocab_size=token_params['vocab_size'],
-            d_model=model_params['d_model'],
-            d_ff=model_params['d_ff'],
-            num_heads=model_params['num_heads'],
-            num_layers=model_params['num_encoder_layers'],
-            num_decoder_layers=model_params['num_decoder_layers'],
-            dropout_rate=model_params['dropout'],
+            vocab_size=token_params["vocab_size"],
+            d_model=model_params["d_model"],
+            d_ff=model_params["d_ff"],
+            num_heads=model_params["num_heads"],
+            num_layers=model_params["num_encoder_layers"],
+            num_decoder_layers=model_params["num_decoder_layers"],
+            dropout_rate=model_params["dropout"],
             decoder_start_token_id=0,
-            # OneRec-Think 特定配置
             use_cache=True,
             is_encoder_decoder=True,
         )
-        
-        # 初始化T5模型
+
+        # -------- 2. 初始化 T5 模型 --------
         self.t5 = T5ForConditionalGeneration(config=t5_config)
-        self.t5.resize_token_embeddings(token_params['vocab_size'])
-        
-        # OneRec-Think 特定组件
-        self.reasoning_head = nn.Linear(model_params['d_model'], model_params['d_model'])
-        self.reasoning_activation = nn.GELU()
-        
-        # 分层token对齐
-        self.semantic_projection = nn.Linear(model_params['d_model'], model_params['d_model'])
-        self.item_projection = nn.Linear(model_params['d_model'], model_params['d_model'])
-        
-        # 推理奖励机制
-        self.reasoning_reward_head = nn.Linear(model_params['d_model'], 1)
-        
-        # 前缀树支持
+        self.t5.resize_token_embeddings(token_params["vocab_size"])
+
+        # -------- 3. 用 MoE 替换 Decoder FFN --------
+        d_model = model_params["d_model"]
+        d_ff = model_params["d_ff"]
+        moe_num_experts = model_params.get("moe_num_experts", 4)
+        moe_dropout = model_params.get("moe_dropout", model_params["dropout"])
+
+        moe_layer_count = 0
+        for block in self.t5.decoder.block:
+            # 对于 decoder：layer 结构一般为 [self-attn, cross-attn, ff]
+            if len(block.layer) == 3 and hasattr(block.layer[2], "DenseReluDense"):
+                block.layer[2].DenseReluDense = MoEFFN(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    num_experts=moe_num_experts,
+                    dropout=moe_dropout,
+                )
+                moe_layer_count += 1
+
+        logger.info(f"[OneRec] Replaced decoder FFN with MoE in {moe_layer_count} layers.")
+
+        # -------- 4. Prefix Trie 支持 --------
         self.prefix_trie_fn = None
         if prefix_trie is not None:
+            # 这里约定 Trie.get_allowed_next_tokens(batch_id, input_ids) 的签名
             self.prefix_trie_fn = prefix_trie.get_allowed_next_tokens
-            logger.info("OneRec 模型已成功加载前缀树 (Prefix Trie)。")
+            logger.info("[OneRec] Loaded Prefix Trie for constrained generation.")
         else:
-            logger.info("OneRec 模型未加载前缀树 (Prefix Trie)。")
-            
-        # 计算参数数量
+            logger.info("[OneRec] No Prefix Trie provided; generation is unconstrained.")
+
+        # 预计算参数量信息
         self.n_params_str = self._calculate_n_parameters()
-        
-        logger.info("OneRec-Think 模型初始化完成")
-    
+        logger.info("OneRec model initialized successfully.")
+
+    # ---------------- basic properties ----------------
     @property
     def task_type(self) -> str:
-        return 'generative'
-    
+        return "generative"
+
     @property
     def n_parameters(self) -> str:
         return self.n_params_str
-    
+
     def _calculate_n_parameters(self) -> str:
-        """计算模型参数数量"""
-        num_params = lambda ps: sum(p.numel() for p in ps if p.requires_grad)
+        def num_params(ps):
+            return sum(p.numel() for p in ps if p.requires_grad)
+
         total_params = num_params(self.parameters())
         t5_params = num_params(self.t5.parameters())
-        reasoning_params = total_params - t5_params
-        
+        other_params = total_params - t5_params
+
         return (
-            f'# T5 backbone parameters: {t5_params:,}\n'
-            f'# Reasoning components parameters: {reasoning_params:,}\n'
-            f'# Total trainable parameters: {total_params:,}\n'
+            f"# T5 backbone parameters: {t5_params:,}\n"
+            f"# Other modules parameters: {other_params:,}\n"
+            f"# Total trainable parameters: {total_params:,}\n"
         )
-    
+
+    # ---------------- training forward ----------------
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        OneRec-Think 前向传播
-        
-        支持两种模式:
-        1. 标准推荐模式 (input_ids, attention_mask, labels)
-        2. 推理模式 (包含reasoning tokens)
+        标准 seq2seq 训练前向：
+        batch 需要包含:
+          - input_ids: (B, L_in)
+          - attention_mask: (B, L_in)
+          - labels: (B, L_out)
         """
-        # 提取T5需要的参数
         t5_inputs = {
-            key: value for key, value in batch.items() 
-            if key in {'input_ids', 'attention_mask', 'labels'}
+            key: value
+            for key, value in batch.items()
+            if key in {"input_ids", "attention_mask", "labels"}
         }
-        
-        # T5前向传播
-        outputs = self.t5(**t5_inputs)
-        
-        # OneRec-Think 增强
-        if hasattr(outputs, 'encoder_last_hidden_state') and outputs.encoder_last_hidden_state is not None:
-            # 编码器输出增强
-            encoder_hidden = outputs.encoder_last_hidden_state
-            
-            # 分层token对齐
-            semantic_features = self.semantic_projection(encoder_hidden)
-            item_features = self.item_projection(encoder_hidden)
-            
-            # 推理激活
-            reasoning_features = self.reasoning_activation(
-                self.reasoning_head(encoder_hidden)
-            )
-            
-            # 计算推理奖励
-            reasoning_rewards = self.reasoning_reward_head(reasoning_features)
-            
-            # 将增强特征添加到输出中
-            outputs.semantic_features = semantic_features
-            outputs.item_features = item_features
-            outputs.reasoning_features = reasoning_features
-            outputs.reasoning_rewards = reasoning_rewards
-        
+
+        outputs = self.t5(**t5_inputs)  # 返回 Seq2SeqLMOutput(loss, logits, ...)
         return outputs
-    
+
+    # ---------------- generation ----------------
     def generate(self, **kwargs: Any) -> torch.Tensor:
         """
-        OneRec-Think 优化生成
-        
-        特性:
-        1. 前缀约束生成
-        2. 推理引导生成
-        3. 优化的beam search
+        生成推荐 SID 序列：
+        - 支持 prefix_allowed_tokens_fn (Prefix Trie)
+        - 支持 beam search / sampling 等策略
         """
+        eval_params = self.cfg.get("evaluation_params", {})
+
         # 注入前缀约束
-        if self.prefix_trie_fn is not None:
-            kwargs.setdefault('prefix_allowed_tokens_fn', self.prefix_trie_fn)
-        
-        # OneRec-Think 生成参数优化
-        generation_config = self.config.get('evaluation_params', {})
-        
-        # 设置默认生成参数
-        kwargs.setdefault('do_sample', generation_config.get('do_sample', False))
-        kwargs.setdefault('temperature', generation_config.get('temperature', 1.0))
-        kwargs.setdefault('top_k', generation_config.get('top_k', 50))
-        kwargs.setdefault('top_p', generation_config.get('top_p', 0.9))
-        kwargs.setdefault('length_penalty', generation_config.get('length_penalty', 1.0))
-        kwargs.setdefault('early_stopping', generation_config.get('early_stopping', True))
-        
+        if self.prefix_trie_fn is not None and "prefix_allowed_tokens_fn" not in kwargs:
+            kwargs["prefix_allowed_tokens_fn"] = self.prefix_trie_fn
+
+        # 默认生成参数（可以被 kwargs 覆盖）
+        kwargs.setdefault("do_sample", eval_params.get("do_sample", False))
+        kwargs.setdefault("temperature", eval_params.get("temperature", 1.0))
+        kwargs.setdefault("top_k", eval_params.get("top_k", 50))
+        kwargs.setdefault("top_p", eval_params.get("top_p", 0.9))
+        kwargs.setdefault("length_penalty", eval_params.get("length_penalty", 1.0))
+        kwargs.setdefault("early_stopping", eval_params.get("early_stopping", True))
+
         return self.t5.generate(**kwargs)
-    
+
+    # ---------------- evaluation ----------------
     def evaluate_step(self, batch: Dict[str, torch.Tensor], topk_list: List[int]) -> Dict[str, float]:
         """
-        OneRec-Think 评估步骤
-        
-        包含:
-        1. 推理引导生成
-        2. 分层token匹配
-        3. 推理质量评估
+        单个 batch 的评估逻辑：
+        - 使用 beam search 生成多个候选 SID
+        - 与 ground-truth code 进行匹配，计算 Recall@k / NDCG@k
         """
-        # 获取评估参数
-        eval_params = self.config['evaluation_params']
-        beam_size = eval_params['beam_size']
-        code_len = self.config['code_len']
-        
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        labels = batch['labels']
+        eval_params = self.cfg["evaluation_params"]
+        beam_size = eval_params["beam_size"]
+        code_len = self.cfg["code_len"]
+
+        input_ids = batch["input_ids"]      # (B, L_in)
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]           # (B, L_label)
         device = input_ids.device
-        batch_size = input_ids.shape[0]
-        
-        # OneRec-Think 生成
+        batch_size = input_ids.size(0)
+
         with torch.no_grad():
             preds = self.generate(
                 input_ids=input_ids,
@@ -204,108 +252,57 @@ class OneRec(AbstractModel):
                 num_beams=beam_size,
                 num_return_sequences=beam_size,
                 max_new_tokens=code_len,
-                early_stopping=eval_params.get('early_stopping', True),
-                length_penalty=eval_params.get('length_penalty', 1.0)
+                length_penalty=eval_params.get("length_penalty", 1.0),
+                early_stopping=eval_params.get("early_stopping", True),
             )
-        
-        # 后处理预测结果
-        preds = preds[:, 1:1 + code_len].view(batch_size, beam_size, -1)
-        
-        # OneRec-Think 分层匹配
-        pos_index = self._calculate_hierarchical_pos_index(
-            preds, labels, maxk=beam_size
-        ).to(device)
-        
-        # 计算指标
-        batch_metrics = {'count': batch_size}
-        
+
+        # 假设 decoder_start_token_id = 0，去掉第一个 start token，只取接下来的 code_len 位
+        preds = preds[:, 1 : 1 + code_len]  # (B * beam_size, code_len)
+        preds = preds.view(batch_size, beam_size, -1)  # (B, beam_size, L_pred)
+
+        # 计算每个样本的“正确位置索引矩阵” (B, beam_size)
+        pos_index = self._calculate_pos_index(preds, labels, maxk=beam_size).to(device)
+
+        batch_metrics: Dict[str, float] = {"count": float(batch_size)}
         for k in topk_list:
             recall_sum = recall_at_k(pos_index, k).sum().item()
             ndcg_sum = ndcg_at_k(pos_index, k).sum().item()
-            
-            batch_metrics[f'Recall@{k}'] = recall_sum
-            batch_metrics[f'NDCG@{k}'] = ndcg_sum
-        
+            batch_metrics[f"Recall@{k}"] = recall_sum
+            batch_metrics[f"NDCG@{k}"] = ndcg_sum
+
         return batch_metrics
-    
-    def _calculate_hierarchical_pos_index(
-        self, 
-        preds: torch.Tensor, 
-        labels: torch.Tensor, 
-        maxk: int
+
+    def _calculate_pos_index(
+        self,
+        preds: torch.Tensor,   # (B, beam_size, L_pred)
+        labels: torch.Tensor,  # (B, L_label)
+        maxk: int,
     ) -> torch.Tensor:
         """
-        OneRec-Think 分层位置索引计算
-        
-        支持:
-        1. 语义层匹配
-        2. 重复层匹配
-        3. 推理一致性检查
+        简单版位置索引：
+        - 完整 SID 序列完全相等视为正确
+        - pos_index[i, j] = True 表示第 i 个样本预测的第 j 个 beam 命中
         """
         preds = preds.detach().cpu()
         labels = labels.detach().cpu()
         B, _, L_pred = preds.shape
-        L_label = labels.shape[1]
-        
-        # 长度对齐
+        L_label = labels.size(1)
+
+        # 长度对齐：截断 / padding（用 0 补）
         if L_pred < L_label:
-            padding = torch.zeros((B, maxk, L_label - L_pred), dtype=preds.dtype)
-            preds = torch.cat([preds, padding], dim=2)
+            pad = torch.zeros((B, maxk, L_label - L_pred), dtype=preds.dtype)
+            preds = torch.cat([preds, pad], dim=2)
         elif L_pred > L_label:
             preds = preds[:, :, :L_label]
-        
+
         pos_index = torch.zeros((B, maxk), dtype=torch.bool)
-        
+
         for i in range(B):
-            gt = labels[i]
-            gt_semantic = gt[:-1].tolist()
-            gt_dup = int(gt[-1].item())
-            
+            gt = labels[i].tolist()
             for j in range(maxk):
-                pj = preds[i, j]
-                pj_semantic = pj[:-1].tolist()
-                pj_dup = int(pj[-1].item())
-                
-                # OneRec-Think 分层匹配
-                semantic_match = pj_semantic == gt_semantic
-                dup_match = pj_dup == gt_dup
-                
-                if semantic_match and dup_match:
+                pj = preds[i, j].tolist()
+                if pj == gt:
                     pos_index[i, j] = True
                     break
-        
+
         return pos_index
-    
-    def compute_reasoning_loss(
-        self, 
-        reasoning_features: torch.Tensor, 
-        reasoning_rewards: torch.Tensor,
-        target_reasoning: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        计算推理损失 (用于强化学习优化)
-        """
-        if target_reasoning is not None:
-            # 监督推理损失
-            reasoning_loss = F.mse_loss(reasoning_features, target_reasoning)
-        else:
-            # 自监督推理损失 (基于奖励)
-            reasoning_loss = -reasoning_rewards.mean()
-        
-        return reasoning_loss
-    
-    def get_reasoning_features(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """
-        提取推理特征 (用于推理质量评估)
-        """
-        with torch.no_grad():
-            encoder_outputs = self.t5.encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            )
-            
-            reasoning_features = self.reasoning_activation(
-                self.reasoning_head(encoder_outputs.last_hidden_state)
-            )
-            
-        return reasoning_features

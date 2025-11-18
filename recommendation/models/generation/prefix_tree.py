@@ -1,108 +1,193 @@
-# models/generation/prefix_trie.py
+# recommendation/models/generation/prefix_tree.py
 
-import torch
+from __future__ import annotations
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import logging
-from typing import List, Dict, Any, Iterable
 
 logger = logging.getLogger(__name__)
 
+
 class Trie:
     """
-    一个用于Hugging Face 'generate'函数的前缀树 (Trie)。
-    它实现了 'prefix_allowed_tokens_fn' 所需的接口。
+    Hash 前缀树版本（性能优化版）：
+
+    - 内部用一个 dict: prefix(tuple[int]) -> List[allowed_next_token_id]
+    - 支持前缀查询缓存，减少重复计算：
+        - 同一个 prefix 在一次生成过程会被多次访问（尤其是 beam search）
+        - 缓存可以显著减少 Python 层开销
+
+    对外接口保持不变：
+    - build_trie_from_codebook(...) 返回的就是这个 Trie
+    - Trie.get_allowed_next_tokens(batch_id, input_ids) 可直接给
+      transformers.generate(prefix_allowed_tokens_fn=...) 使用
     """
-    
-    # 定义一个特殊的Token来标记序列的结束
-    END_TOKEN = -1
 
-    def __init__(self, eos_token_id: int):
+    def __init__(
+        self,
+        eos_token_id: Optional[int] = None,
+        pad_token_id: int = 0,
+        skip_bos: int = 1,
+        use_cache: bool = True,
+        max_cache_size: int = 100_000,
+    ) -> None:
         """
-        初始化Trie。
-        
         Args:
-            eos_token_id (int): 当一个序列在Trie中完成时，
-                                我们将强制模型生成这个Token。
+            eos_token_id: 生成结束用的 EOS id（TIGER 用 config['token_params']['eos_token_id']）
+            pad_token_id: code 序列中的 padding id（通常是 0，会在构建时滤掉）
+            skip_bos: 在 get_allowed_next_tokens 中，从 input_ids 前面跳过多少个 token。
+                      对 TIGER 而言，decoder_start_token_id=0，所以一般为 1。
+            use_cache: 是否启用查询缓存（推荐 True）
+            max_cache_size: 缓存中允许的最大不同前缀数量，超过后自动清空缓存
         """
-        self.root: Dict[int, Any] = {}
         self.eos_token_id = eos_token_id
-        logger.info(f"Trie a初始化，将使用 EOS Token ID: {eos_token_id}")
+        self.pad_token_id = pad_token_id
+        self.skip_bos = skip_bos
 
-    def add_sequence(self, sequence: List[int]):
-        """
-        将一个合法的Token序列添加到Trie中。
-        
-        例如: [100, 205, 301, 5] (c0, c1, c2, dup)
-        """
-        node = self.root
-        for token in sequence:
-            if token not in node:
-                node[token] = {}
-            node = node[token]
-        
-        # 在序列的末尾标记 "END"
-        node[self.END_TOKEN] = True
+        # prefix(tuple[int]) -> List[int]
+        self._table: Dict[Tuple[int, ...], List[int]] = {}
 
-    def get_allowed_next_tokens(self, batch_id: int, input_ids: torch.Tensor) -> List[int]:
+        # 查询缓存：prefix(tuple[int]) -> List[int]
+        self._use_cache = use_cache
+        self._cache: Dict[Tuple[int, ...], List[int]] = {}
+        self._max_cache_size = max_cache_size
+
+    # ----------------------------------------------------------------------
+    # 构建阶段：从所有合法 code 序列里构建 prefix -> next_tokens 映射
+    # ----------------------------------------------------------------------
+    def bulk_insert(self, sequences: Iterable[Sequence[int]]) -> None:
         """
-        Hugging Face 'generate' 会调用的核心函数。
-        
+        直接从所有合法的 code 序列构建前缀表。
+
         Args:
-            batch_id (int): 当前批次中的索引 (我们通常忽略)。
-            input_ids (torch.Tensor): *已经* 生成的Token序列。
-                                      对于T5/TIGER，它通常以 [0] (pad/start) 开头。
-        
-        Returns:
-            List[int]: 接下来 *允许* 生成的Token ID列表。
+            sequences: 形如 [[c1,c2,...,cL], ...]，每个都是一个完整的 code。
+                       注意：这里的序列不包含 decoder_start_token_id，只是纯 code。
         """
-        
-        # 1. 获取当前序列并清理 (去掉T5的起始Token 0)
-        current_sequence = input_ids.tolist()
-        if current_sequence and current_sequence[0] == 0:
-            current_sequence = current_sequence[1:]
+        table: Dict[Tuple[int, ...], set[int]] = {}
+        n_seq = 0
 
-        # 2. 在Trie中遍历当前序列
-        node = self.root
-        for token in current_sequence:
-            if token in node:
-                node = node[token]
+        for seq in sequences:
+            # 转成 int，并去掉 pad
+            seq = [int(t) for t in seq if t != self.pad_token_id]
+            if not seq:
+                continue
+
+            n_seq += 1
+
+            # extended: seq (+ eos)，保证完整 code 之后还能结束
+            if self.eos_token_id is not None:
+                extended = seq + [self.eos_token_id]
             else:
-                # 如果走到了一个无效路径 (理论上不应发生，除非beam search出错了)
-                # 安全起见，返回EOS
-                logger.warning(f"Trie: 无效的中间路径 {current_sequence}")
-                return [self.eos_token_id]
+                extended = seq
 
-        # 3. 决定下一步能走哪些Token
-        if self.END_TOKEN in node:
-            # 这条路径已经是一个完整的、合法的Item Code了。
-            # 强制模型停止生成 (只允许生成EOS)。
-            return [self.eos_token_id]
+            # 对 extended 的每个前缀 extended[:i]，记录下一个 token extended[i]
+            # i 可以是 0，表示还没生成任何 code，这样 prefix=() 也会有一组起始 token
+            for i in range(len(extended)):
+                prefix = tuple(extended[:i])
+                next_token = extended[i]
+
+                if prefix not in table:
+                    table[prefix] = set()
+                table[prefix].add(next_token)
+
+        # set -> list，节省一点内存
+        self._table = {k: list(v) for k, v in table.items()}
+
+        # 构建完清空缓存
+        self._cache.clear()
+
+        logger.info(
+            f"[Trie(Hash+Cache)] Built from {n_seq} sequences, "
+            f"unique prefixes: {len(self._table)}, "
+            f"use_cache={self._use_cache}, max_cache_size={self._max_cache_size}"
+        )
+
+    # ----------------------------------------------------------------------
+    # 查询阶段：给 HF generate / logits_processor 用的接口
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _ids_to_prefix_tuple(ids, skip_bos: int) -> Tuple[int, ...]:
+        """
+        将当前 decoder input_ids 转成 prefix tuple：
+        - ids: 1D tensor/list，如 [decoder_start, c1, c2, ...]
+        - skip_bos: 跳过前面的 BOS / decoder_start token 数
+        """
+        # transformers 通常会给一个 1D LongTensor，这里统一成 Python list
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+
+        # 只取 code 部分作为前缀（不再过滤 pad，因为 decoder 侧通常没 pad）
+        # 这里假设 pad_token 还没出现在 decoder_prefix 里，若你后面确实会 pad，可以再加过滤。
+        return tuple(int(t) for t in ids[skip_bos:])
+
+    def _lookup(self, prefix: Tuple[int, ...]) -> List[int]:
+        """
+        内部查表 + 缓存逻辑。
+        """
+        # 1) 先查缓存
+        if self._use_cache and prefix in self._cache:
+            return self._cache[prefix]
+
+        # 2) 查主表
+        if prefix in self._table:
+            allowed = self._table[prefix]
         else:
-            # 序列尚未完成，返回所有可能的下一步Token。
-            # (node.keys() 包含了所有合法的 c1, c2, dup... 等)
-            return list(node.keys())
+            # 不在主表：非法前缀，尽量只允许 eos 结束
+            if self.eos_token_id is not None:
+                allowed = [self.eos_token_id]
+            else:
+                # 实在不行就返回空（不推荐走到这里）
+                allowed = []
+
+        # 3) 写入缓存（如果开启）
+        if self._use_cache:
+            # 简单策略：缓存太大就清空一次
+            if len(self._cache) >= self._max_cache_size:
+                self._cache.clear()
+            self._cache[prefix] = allowed
+
+        return allowed
+
+    def get_allowed_next_tokens(self, batch_id: int, input_ids) -> List[int]:
+        """
+        核心接口：给 Transformers generate(prefix_allowed_tokens_fn=...) 用。
+
+        Args:
+            batch_id: HF 的 batch 索引（这里用不到）
+            input_ids: 当前 decoder 已经生成的 token 序列（1D）
+
+        Returns:
+            一组允许的下一个 token id 列表。
+        """
+        prefix = self._ids_to_prefix_tuple(input_ids, self.skip_bos)
+        return self._lookup(prefix)
 
 
+# ----------------------------------------------------------------------
+# 工厂函数：保持原来的调用接口不变
+# ----------------------------------------------------------------------
 def build_trie_from_codebook(
-    token_sequences: Iterable[List[int]], 
-    eos_token_id: int
+    token_sequences: Iterable[Sequence[int]],
+    eos_token_id: Optional[int] = None,
 ) -> Trie:
     """
-    辅助函数：从codebook的Token序列构建Trie。
-    
+    从 codebook 序列构建 Hash 前缀树 Trie（带缓存）。
+
     Args:
-        token_sequences (Iterable[List[int]]): 
-            所有合法的、完整的Token序列的列表。
-            例如: [[100, 205, 301, 5], [100, 206, 302, 6], ...]
-        eos_token_id (int): 模型的EOS Token ID。
-            
+        token_sequences: 一般是 item_to_code_map.values()，每个是一个 code 序列
+        eos_token_id: 生成结束 token id
+
     Returns:
-        Trie: 构建完成的前缀树。
+        Trie 实例（Hash+Cache 版）
     """
-    trie = Trie(eos_token_id=eos_token_id)
-    count = 0
-    for seq in token_sequences:
-        trie.add_sequence(seq)
-        count += 1
-    
-    logger.info(f"成功构建前缀树 (Prefix Trie)，共加载 {count} 条合法序列。")
+    # 假设：
+    # - code 中的 padding 是 0
+    # - decoder_start_token_id 占用了第 0 个位置，真正的 code 从位置 1 开始
+    trie = Trie(
+        eos_token_id=eos_token_id,
+        pad_token_id=0,
+        skip_bos=1,
+        use_cache=True,
+        max_cache_size=100_000,
+    )
+    trie.bulk_insert(token_sequences)
     return trie

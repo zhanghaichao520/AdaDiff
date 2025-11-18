@@ -379,7 +379,10 @@ class RQVAE(nn.Module):
         _, _, code = self.quantizer(z_e)
         return code
 
-    def compute_loss(self, forward_outputs, xs=None, valid=False):
+    def compute_loss(self, forward_outputs, batch_data=None, valid=False):
+
+        xs = batch_data
+
         out, quant_loss, code = forward_outputs
         
         if self.loss_type == "mse":

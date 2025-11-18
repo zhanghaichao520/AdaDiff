@@ -1,15 +1,15 @@
 # 檔案路徑: configs/OneRec.yaml
 
-# MiniOneRec 模型配置 - 轻量化生成式推荐架构
+# OneRec 模型独有的架构参数
 model_params:
   max_len: 100
-  d_model: 512
+  d_model: 1024
   d_ff: 1536  # 优化的前馈网络维度 (3/4 * 2048)
   num_heads: 8
-  num_encoder_layers: 4  # 减少层数以提高效率
-  num_decoder_layers: 4
+  num_encoder_layers: 8  # 减少层数以提高效率
+  num_decoder_layers: 8
   dropout: 0.1
-  # MiniOneRec 特定参数
+  # OneRec 特定参数
   use_swiglu: true  # 启用SwiGLU激活函数
   pre_norm: true    # 使用Pre-norm架构
   weight_sharing: true  # token embedding和输出层权重共享
@@ -21,7 +21,7 @@ training_params:
   warmup_steps: 1000
   weight_decay: 0.01
   gradient_clip_norm: 1.0
-  # MiniOneRec 训练优化
+  # OneRec 训练优化
   label_smoothing: 0.1
   accumulate_grad_batches: 2
 
@@ -31,7 +31,7 @@ evaluation_params:
   beam_size: 10  # 优化的beam search大小
   early_stopping: true
   length_penalty: 1.0
-  # MiniOneRec 生成优化
+  # OneRec 生成优化
   do_sample: false  # 使用确定性生成
   temperature: 1.0
   top_k: 50

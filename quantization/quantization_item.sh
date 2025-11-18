@@ -1,8 +1,8 @@
 python main.py \
   --model_name rqvae \
-  --dataset_name Baby \
-  --embedding_modality fused \
-  --embedding_model text-embedding-3-large-clip-vit-base-patch32
+  --dataset_name Musical_Instruments \
+  --embedding_modality text \
+  --embedding_model text-embedding-3-large
 
 # 多模态
 python main.py \
