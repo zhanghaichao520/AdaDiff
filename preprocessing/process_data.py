@@ -145,7 +145,7 @@ def preprocess_movielens(args):
     _, _, rating_inters = load_ratings(rating_file_path)
 
     # 加载电影元数据
-    movies_file_path = os.path.join(input_root_path, f'{args.dataset}_movies.json')
+    movies_file_path = os.path.join(input_root_path, f'{args.dataset}.item.json')
     if not os.path.exists(movies_file_path):
         raise FileNotFoundError(f"Movies file not found: {movies_file_path}")
     
