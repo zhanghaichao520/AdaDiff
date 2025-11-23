@@ -38,6 +38,7 @@ class TIGER(AbstractModel):
         **token_params,
         decoder_start_token_id=0
     )
+    
     self.t5 = T5ForConditionalGeneration(config=t5config)
     self.t5.resize_token_embeddings(config['token_params']['vocab_size'])
     self.n_params_str = self._calculate_n_parameters() # 在初始化时计算一次

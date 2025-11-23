@@ -1,81 +1,118 @@
-# GenRec
+# UniGenRec
 <p align="center">
-  <img src="./asset/Logo.png" width="200">
+  <img src="./asset/logo.png" width="200">
 </p>
 
-$\textbf{GenRec}$: A unified **Gen**erative **Rec**ommendation toolbox that simplifies end-to-end generative recommender research.  
-📘 [arXiv Paper (coming soon)](https://arxiv.org/abs/2501.xxxxx)  
-:point_right: Check our **survey on generative recommendation (2025)** (to appear).  
-:point_right: Explore **awesome resources on GenRec** → [Generative Recommendation Resources](https://github.com/yourname/GenRecHub-Resources).  
+**UniGenRec** — A unified, modular, configuration-driven **Generative Recommendation** toolbox.  
+It provides an end-to-end reproducible pipeline covering **Representation → Tokenization → Modeling → Training → Inference**.
 
----
-
-## 🔧 Toolbox Overview
-<p align="center">
-  <img src="./images/GenRecHub.png" width="500">
-</p>
-
-GenRecHub provides a modular and reproducible pipeline for **end-to-end generative recommendation**.
-It unifies data preprocessing, tokenization, generation, and evaluation under a single configuration-driven framework.
-
----
-
-# ⚙️ Capability Matrix
-
-## Dataset
-
-| Dataset | Implemented |
-|--------------------|--------------|
-| Amazon | ✅ |
-| Movie Lens| ✅ |
-
-## 💬 Embedding Extraction
-| Category | Component / Method | Done |
-|-----------|--------------------|--------------|
-| 🧠 Textual | Local Embedding (Qwen, T5) | ✅ |
-|  | OpenAI Embedding API | ✅ |
-| 🖼️ Visual | CLIP Encoder | ✅ |
-|  | Multimodal Fusion | ✅ |
-| 👥 Collaborative | SASRec Sequence Embedding | ✅ |
-| 🧩 Management | PCA Compression & Storage | ✅ |
-
-## 🧩 Quantization
-| Category | Component / Method | Done |
-|-----------|--------------------|--------------|
-| 🔸 Residual Family | RQ-VAE | ✅ |
-|  | R-KMeans | ✅ |
-|  | VQ-VAE   | ✅ |
-|  | R-VQ     | ✅ |
-| 🔹 Product Family | OPQ | ✅ |
-|  | PQ   | ✅ |
-
-## ⚙️ Recommendation Architecture
-| Category | Component / Method | Done |
-|-----------|--------------------|--------------|
-| 🧠 Encoder–Decoder | Sentence T5 | ✅ |
-| 💬 Decoder-Only | GPT2 | ✅ |
-|                 | LLM(Qwen, LLaMA) | ✅ |
-| 🔍 Encoder-Retrieval | RPG | ✅ |
-| 🔍 LLM Instruction Fine Tune | Qwen, LLaMA | - |
-| 🔧 Plugins | Beam Search | - |
-|  | Prefix Tree Constraint | - |
+📘 arXiv Paper (coming soon)  
 
 
+# 🔥 Introduction
+Generative Recommendation is rapidly emerging as a new paradigm, shifting from **scoring/matching** → **generative modeling**. However, the current GenRec ecosystem is **highly fragmented**:
+- **Representation & Tokenization** are inconsistent (RQ-VAE, VQ-VAE, OPQ, RKMeans, LETTER…)  
+- **Backbones** vary widely (Encoder–Decoder, Decoder-only LLMs, Retrieval-Hybrids)  
+- **Training & Inference** pipelines differ significantly (beam search, prefix-tree, guided decoding)
+
+As a result: **models are not comparable, not extensible, and often not reproducible**.
+
+# 🎯 Goal
+
+UniGenRec provides a **single, configuration-driven, plug-and-play GenRec stack**, unifying  **Representation → Tokenization → Backbone → Training → Inference** to enable reproducible research and fair comparison across models.
+
+- **A fully unified GenRec stack**
+- **Modular and plug-and-play components**
+- **Reproducible experiments with config-based control**
+- **Fair comparison across GenRec models**
+- **First open-source standardization of SID-based modeling**
 
 
+# 🔧 Pipeline Overview
 
-
+```
+Raw Data
+↓
+Download + Preprocessing
+↓
+Embedding Generation (Text / Image / CF / VLM)
+↓
+Multimodal Fusion (optional)
+↓
+Quantization (RQ-VAE / OPQ / PQ / RKMeans)
+↓
+Generative Recommender (TIGER / RPG / LETTER / LLMs)
+↓
+Inference (Beam Search / Prefix-tree / Contrastive Rerank)
+```
 
 
 ---
 
-## 📦 Supported Models
+# 🧱 Capability Matrix
 
-| **Category** | **Model** | **Paper** | **Conference/Journal** | **Code** | **Done** |
-|---------------|------------|-----------|------------------------|-----------|-----------|
-| **Encoder-Decoder** | TIGER | [Recommender Systems with Generative Retrieval](https://arxiv.org/pdf/2305.05065) | NIPS' 23 | rqvae.py + TIGER.py | ✅ |
-| **Encoder-Retrieval** | RPG | [Generating Long Semantic IDs in Parallel for Recommendation](http://arxiv.org/abs/2506.05781) | KDD' 25 | opq.py + RPG.py | ✅ | 
-| **Quantization** | LETTER | [Learnable Item Tokenization for Generative Recommendation](https://dl.acm.org/doi/10.1145/3627673.3679569) | CIKM' 24 | rqvae_letter.py + TIGER.py | ✅ |
+| Dimension | Category | Supported Components | Status |
+|----------|----------|----------------------|--------|
+| **Data** | Datasets | Amazon, MovieLens | ✓ |
+|          | Input Formats | Raw IDs, Embeddings, Codebooks (SID) | ✓ |
+| **Representation** | Text | Qwen, T5, OpenAI Embedding API | ✓ |
+|                   | Vision | CLIP ViT | ✓ |
+|                   | Collaborative | SASRec | ✓ |
+|                   | Fusion | Concat, MLP Fusion | ✓ |
+| **Tokenization / Quantization** | Residual Family | RQ-VAE, Residual KMeans, Residual-VQ | ✓ |
+|                                | Product Family | OPQ, PQ | ✓ |
+|                                | Other | VQ-VAE, Multi-Codebook (RPG-style) | ✓ |
+| **Backbone** | Encoder–Decoder | TIGER-style architectures | ✓ |
+|              | Decoder-only LLM | GPT-2, Qwen, LLaMA | ✓ |
+|              | Retrieval-Hybrid | RPG-style architectures | ✓ |
+| **Training** | Objectives | LM Loss, Contrastive Loss, Hybrid Loss | ✓ |
+|              | Paradigms | SFT, Alignment, Multi-stage Training | ✓ |
+| **Inference** | Decoding | Greedy, Beam Search | ✓ |
+|               | Constraints | Prefix-Tree | ✓  |
 
 
 
+
+# 🚀 Quick Start
+
+
+**Requirements**
+- Python **3.10** (recommended)
+- PyTorch, CUDA, and other dependencies will be installed automatically via `requirements.txt`
+
+```bash
+git clone https://github.com/yourname/UniGenRec
+cd UniGenRec
+pip install -r requirements.txt
+```
+## 1 Data Preprocessing
+
+For dataset downloading, cleaning, formatting, and multimodal data preparation  
+(**including text/image extraction, interaction filtering, metadata normalization**),  
+please refer to the dedicated guide:
+
+👉 **See detailed tutorial:**  
+[GenRec-Factory Data Processing & Embedding Guide](./preprocessing/ReadMe.md)
+
+This includes:
+
+## 2 Quantization
+
+```bash
+cd quantization
+
+python main.py \
+  --model_name rqvae \
+  --dataset_name Musical_Instruments \
+  --embedding_modality text \
+  --embedding_model text-embedding-3-large
+```
+
+## 3 Generative Recommendation Models
+
+```bash
+python main.py \
+  --model TIGER \
+  --dataset Baby \
+  --quant_method rqvae
+```

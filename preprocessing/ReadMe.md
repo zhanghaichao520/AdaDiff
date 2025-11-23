@@ -1,4 +1,4 @@
-# 🧩 GenRec-Factory 数据处理与Embedding
+# 🧩 UniGenRec 数据处理与Embedding
 
 本项目提供从 **原始数据下载 → 数据预处理 → 文本与图像 Embedding 生成 → 多模态融合** 的一站式处理脚本。  
 以 Amazon 与 MovieLens 为例。
