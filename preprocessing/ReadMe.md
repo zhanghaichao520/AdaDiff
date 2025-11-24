@@ -23,7 +23,7 @@ python download_data.py --source movielens --dataset ml-1m
 
 ```bash
 # Amazon 类数据集
-python download_images.py --dataset_type amazon --dataset Sports_and_Outdoors
+python download_images.py --dataset_type amazon --dataset Musical_Instruments
 
 # MovieLens 数据集
 python download_images.py --dataset_type movielens --dataset ml-1m
@@ -73,8 +73,8 @@ python process_embedding.py \
 ```bash
 python process_embedding.py \
     --embedding_type image_clip \
-    --dataset Baby \
-    --clip_model_name /home/wj/peiyu/LLM_Models/openai-mirror/clip-vit-base-patch32 \
+    --dataset Musical_Instruments \
+    --clip_model_name /home/peiyu/PEIYU/LLM_Models/openai-mirror/clip-vit-base-patch32 \
     --pca_dim 512
 ```
 
@@ -89,26 +89,15 @@ python process_embedding.py \
     --pca_dim 0
 ```
 
-### 生成 Qwen-VL 融合嵌入:
-
-```bash
-python process_embedding.py \
-    --embedding_type vlm_fused \
-    --dataset Baby \
-    --vlm_model_name_or_path Qwen/Qwen3-VL-7B-Instruct \
-    --batch_size 16  # 注意调小 VLM batch size
-    --pca_dim 512
-```
-
-
 ## 5. 模态融合
 
 ```bash
-python fusion_embedding.py \
-    --dataset Baby \
-    --text_model_tag "text-embedding-3-large" \
-    --image_model_tag "clip-vit-base-patch32" \
-    --fusion_epochs 10 \
-    --batch_size 4096 \
-    --fusion_out_dim 512
+python preprocessing/train_fusion_attention.py \
+  --dataset Baby \
+  --text_model_tag "Qwen/Qwen3-VL-7B-Instruct" \
+  --image_model_tag "openai/clip-vit-base-patch32" \
+  --fusion_out_dim 512 \
+  --epochs 10 \
+  --batch_size 1024 \
+  --output_tag "sota-attn"
 ```
