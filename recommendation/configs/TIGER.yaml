@@ -19,4 +19,4 @@ training_params:
   # 注意：我們沒有寫 batch_size，它會自動從 base.yaml 繼承
 
 evaluation_params:
-  use_prefix_trie: true # <--- 在这里控制！
+  use_prefix_trie: false # <--- 在这里控制！

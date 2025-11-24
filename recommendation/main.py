@@ -32,7 +32,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, help='模型名稱 (e.g., TIGER, GPT2, RPG)')
     parser.add_argument('--dataset', type=str, required=True, help='数据集名稱 (e.g., Beauty)')
     parser.add_argument('--quant_method', type=str, required=True, choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq', 'vqvae', 'mm_rqvae'], help='量化方法')
-    parser.add_argument('--embedding_modality', type=str, default='text', choices=['text', 'image', 'fused', 'lfused'], help='量化模态类型，对应不同的 codebook (默认 text)')
+    parser.add_argument('--embedding_modality', type=str, default='text', choices=['text', 'image', 'fused', 'lfused', 'cf'], help='量化模态类型，对应不同的 codebook (默认 text)')
 
     
     # ✅ (已移除) 删除了 --no_trie 命令行参数

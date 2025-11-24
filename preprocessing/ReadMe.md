@@ -83,9 +83,9 @@ python process_embedding.py \
 ```bash
 python process_embedding.py \
     --embedding_type cf_sasrec \
-    --dataset Baby \
+    --dataset Sports_and_Outdoors \
     --sasrec_hidden_dim 64 \
-    --sasrec_epochs 30 \
+    --sasrec_epochs 100 \
     --pca_dim 0
 ```
 
