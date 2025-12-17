@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from transformers import BertConfig, BertForMaskedLM
-
+import random
 from recommendation.metrics import (
     recall_at_k,
     ndcg_at_k,
@@ -67,6 +67,20 @@ class AdaDiff(AbstractModel):
         self.vocab_size = token_params["vocab_size"]
         self.vocab_sizes = config["vocab_sizes"]
         self.bases = config["bases"]
+        self.training_diffusion_steps = int(model_params.get("diffusion_steps", 4))
+        self.history_mask_prob = float(model_params.get("history_mask_prob", 0.15))
+        raw_weights = model_params.get("layer_mask_weights", [1.0] * self.code_len)
+        if len(raw_weights) != self.code_len:
+            logger.warning(
+                f"[AdaDiff] layer_mask_weights length {len(raw_weights)} "
+                f"!= code_len {self.code_len}; will align by trunc/pad."
+            )
+        aligned_weights = self._align_layer_weights(raw_weights, self.code_len)
+        self.register_buffer(
+            "layer_mask_weights",
+            torch.tensor(aligned_weights, dtype=torch.float),
+            persistent=False,
+        )
         
         # level 范圍：用於 prefix 判斷
         level_starts = [b + 1 for b in self.bases]
@@ -105,23 +119,22 @@ class AdaDiff(AbstractModel):
         eval_params = config.get("evaluation_params", {})
         self.beam_size = int(eval_params.get("beam_size", 20))
         self.lambda_div = float(
-            eval_params.get("lambda_div", model_params.get("lambda_div", 0.0))
+            eval_params.get("lambda_div", 0.0)
         )
         # 採樣階段的獨立制導係數
         self.lambda_div_sampling = float(
-            eval_params.get(
-                "lambda_div_sampling",
-                0.0 if self.lambda_div > 0 else self.lambda_div,
-            )
+            eval_params.get("lambda_div_sampling", 0.0)
+        )
+        self.use_time_anneal_guidance = bool(
+            eval_params.get("time_anneal_guidance", True)
+        )
+        self.debug_logit_stats = bool(
+            eval_params.get("debug_logit_stats", False)
         )
         self.temperature = float(
-            eval_params.get("temperature", eval_params.get("sampling_temperature", 0.3))
+            eval_params.get("temperature", 0.3)
         )
         
-        # 參數自適應調整
-        if self.lambda_div > 0 and self.temperature < 0.5:
-            logger.info(f"[Init] Auto-adjusting temperature from {self.temperature} to 0.5 for diversity guidance.")
-            self.temperature = 0.5
             
         self.top_k = int(eval_params.get("top_k", eval_params.get("topk_sampling", 10)))
         min_topk = max(self.beam_size * 2, 32)
@@ -154,7 +167,11 @@ class AdaDiff(AbstractModel):
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
+
+        if self.training:
+            input_ids, labels = self._apply_training_mask(input_ids, attention_mask)
+        else:
+            labels = batch.get("labels", torch.full_like(input_ids, -100))
 
         outputs = self.backbone(
             input_ids=input_ids, attention_mask=attention_mask, return_dict=True
@@ -166,12 +183,75 @@ class AdaDiff(AbstractModel):
 
         return {"loss": loss, "logits": logits}
 
+    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Hierarchical priority transition kernel (forward diffusion).
+        x_start: [B, code_len] tokens before masking
+        t:       [B] or scalar timestep
+        Returns (x_t, mask) where x_t has hierarchical masks applied.
+        """
+        mask_token = torch.full_like(x_start, self.mask_token_id)
+        # Base mask prob from (approx.) noise schedule; scaled to [0,1].
+        t = t.to(x_start.device).float()
+        if t.dim() == 0:
+            t = t.view(1)
+        base_prob = ((t + 1.0) / float(max(self.training_diffusion_steps, 1))).clamp(0.0, 1.0)
+        base_prob = base_prob.view(-1, 1)  # [B,1]
+
+        # Hierarchical scaling: coarse depths receive higher mask prob.
+        layer_weights = self.layer_mask_weights.view(1, -1)  # [1, code_len]
+        p_mask = torch.clamp(base_prob * layer_weights, 0.0, 1.0)  # [B, code_len]
+        mask = torch.bernoulli(p_mask).bool()
+        x_t = torch.where(mask, mask_token, x_start)
+        return x_t, mask
+
+    def _apply_training_mask(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply GPU-side masking for training:
+        - History tokens masked with uniform prob.
+        - Target codes masked with hierarchical q_sample.
+        """
+        device = input_ids.device
+        x = input_ids.clone()
+        labels = torch.full_like(x, -100)
+        bsz, seq_len = x.shape
+        target_start = seq_len - self.code_len
+
+        # Mask history tokens (between [CLS] and [SEP]) on GPU
+        if self.history_mask_prob > 0:
+            positions = torch.arange(seq_len, device=device).unsqueeze(0)
+            cls_pos = (x == self.cls_token_id).float().argmax(dim=1, keepdim=True)
+            sep_pos = (x == self.sep_token_id).float().argmax(dim=1, keepdim=True)
+            hist_region = (positions > cls_pos) & (positions < sep_pos) & attention_mask.bool()
+            if hist_region.any():
+                hist_mask = (torch.rand_like(x.float()) < self.history_mask_prob) & hist_region
+                labels = labels.masked_scatter(hist_mask, x[hist_mask])
+                x = x.masked_fill(hist_mask, self.mask_token_id)
+
+        # Hierarchical masking on target codes
+        target_slice = x[:, target_start:]
+        t = torch.randint(
+            low=0,
+            high=max(self.training_diffusion_steps, 1),
+            size=(bsz,),
+            device=device,
+        )
+        target_noised, target_mask = self.q_sample(target_slice, t)
+        target_labels = labels[:, target_start:]
+        target_labels[target_mask] = target_slice[target_mask]
+        labels[:, target_start:] = target_labels
+        x[:, target_start:] = target_noised
+
+        return x, labels
+
     @torch.no_grad()
     def evaluate_step(
         self, batch: Dict[str, torch.Tensor], topk_list: List[int]
     ) -> Dict[str, float]:
         """
-        迭代去噪 + 多樣性制導評估
+        Iterative Denoising + Energy-Guided Inference (with Auto-Scaling)
         """
         device = batch["input_ids"].device
         input_ids = batch["input_ids"].to(device)
@@ -183,23 +263,24 @@ class AdaDiff(AbstractModel):
         target_start = seq_len - target_len
         mask_value = -1e9
 
-        # 1) 多樣性懲罰計算
+        # 1) Calculate Diversity Penalty (Energy Function)
         diversity_penalty = self._calculate_diversity_penalty(
             input_ids=input_ids,
             attention_mask=attention_mask,
             target_start=target_start,
         )
 
-        # 2) 構造 prefix mask (Target 區域的前兩級)
+        # 2) Construct prefix mask (Apply only to coarse levels)
         prefix_mask = torch.zeros(seq_len, device=device, dtype=torch.float)
-        penalty_offset = 1 if self.lambda_div > 0 else 0
-        penalty_len = min(2 if penalty_offset == 0 else 1, max(0, target_len - penalty_offset))
+        # Using configured coarse levels or default to 2
+        coarse_levels = getattr(self, "coarse_level_count", 2) 
+        penalty_len = min(coarse_levels, target_len)
+        
         if penalty_len > 0:
-            start = target_start + penalty_offset
-            prefix_mask[start : start + penalty_len] = 1.0
+            prefix_mask[target_start : target_start + penalty_len] = 1.0
         prefix_mask = prefix_mask.unsqueeze(0)
 
-        # 3) 擴展 Batch 進行 Beam Search
+        # 3) Expand Batch for Beam Search
         expanded_ids = input_ids.clone()
         expanded_ids[:, target_start:] = self.mask_token_id
         expanded_ids = (
@@ -212,6 +293,8 @@ class AdaDiff(AbstractModel):
             .repeat(1, self.beam_size, 1)
             .view(batch_size * self.beam_size, seq_len)
         )
+        # Efficient expansion without repeat (using broadcasting later)
+        # We expand here to keep logic consistent with previous version, but note broadcasting is possible
         expanded_penalty = diversity_penalty.unsqueeze(1).repeat(1, self.beam_size, 1).view(
             batch_size * self.beam_size, -1
         )
@@ -220,7 +303,7 @@ class AdaDiff(AbstractModel):
             batch_size * self.beam_size, device=device, dtype=torch.bool
         )
 
-        # 4) 迭代去噪循環
+        # 4) Iterative Denoising Loop
         for t in range(self.num_inference_steps):
             current_target = expanded_ids[:, target_start:]
             prefix_lens: Optional[torch.Tensor] = None
@@ -238,10 +321,60 @@ class AdaDiff(AbstractModel):
             )
             logits = outputs.logits
 
-            # Step B: 注入制導
-            guided_logits = logits - self.lambda_div_sampling * expanded_penalty.unsqueeze(1) * expanded_prefix_mask.unsqueeze(-1)
+            # --- [Modification Start] Adaptive Guidance Injection ---
+            
+            # A. Calculate Statistics for Auto-Scaling
+            # We want the guidance term to be comparable to the logits' standard deviation
+            current_logits_std = logits.std()
+            
+            # Calculate the mean intensity of the penalty where it is non-zero
+            # (Avoid dragging down the mean with zeros)
+            penalty_active_mask = expanded_penalty > 0
+            if penalty_active_mask.any():
+                penalty_intensity = expanded_penalty[penalty_active_mask].mean()
+            else:
+                penalty_intensity = 1.0 # Fallback
+            
+            # Auto-Scale Factor: 
+            # If we apply this, a penalty of '1.0' becomes equivalent to '1.0 std of logits'
+            auto_scale = current_logits_std / (penalty_intensity + 1e-9)
 
-            # Step C: 採樣 (使用 guided logits)
+            # B. Time Annealing Factor
+            if self.use_time_anneal_guidance and self.num_inference_steps > 1:
+                # Linear decay: 1.0 at t=0 (start), 0.0 at t=T (end)
+                # Note: t goes 0 -> T-1. 
+                time_factor = 1.0 - float(t) / float(self.num_inference_steps - 1)
+            else:
+                time_factor = 1.0
+
+            # C. Calculate Effective Guidance
+            # Formula: lambda * time * scale * penalty * mask
+            current_lambda = self.lambda_div_sampling * time_factor * auto_scale
+            
+            guidance_term = current_lambda * expanded_penalty.unsqueeze(1) * expanded_prefix_mask.unsqueeze(-1)
+            
+            # D. Apply Guidance
+            guided_logits = logits - guidance_term
+
+            # E. Logging (Optional)
+            if self.debug_logit_stats and t == 0 and not hasattr(self, "_logged_logit_stats"):
+                logits_mean = logits.mean().item()
+                logits_std_val = current_logits_std.item()
+                guide_mean = guidance_term.mean().item()
+                guide_abs = guidance_term.abs().mean().item()
+                # Max guidance is useful to see the peak penalty
+                guide_max = guidance_term.max().item()
+                
+                logger.info(
+                    f"[Debug] Step {t}: Logits mean/std: {logits_mean:.4f}/{logits_std_val:.4f} | "
+                    f"Guidance max/abs_mean: {guide_max:.4f}/{guide_abs:.4f} | "
+                    f"Scale: {auto_scale.item():.2f} (Lambda: {self.lambda_div_sampling})"
+                )
+                self._logged_logit_stats = True
+            
+            # --- [Modification End] ---
+
+            # Step C: Sampling
             target_logits = guided_logits[:, target_start:, :] / max(self.temperature, 1e-5)
             target_logits = target_logits.masked_fill(~self.level_token_mask, mask_value)
             
@@ -257,7 +390,7 @@ class AdaDiff(AbstractModel):
             ).view(-1, target_len, 1)
             sampled_tokens = topk_ids.gather(-1, sampled).squeeze(-1)
 
-            # Step D: 自適應重掩碼
+            # Step D: Adaptive Remasking (Confidence-based)
             conf_logits = guided_logits[:, target_start:, :].masked_fill(~self.level_token_mask, mask_value)
             if self.prefix_trie is not None:
                 dead_beam_mask |= self._mask_logits_with_trie(
@@ -265,13 +398,17 @@ class AdaDiff(AbstractModel):
                 )
             target_conf = torch.softmax(conf_logits, dim=-1).max(dim=-1).values
             
-            threshold = min(0.05, float(t + 1) / float(self.num_inference_steps + 1))
+            # Dynamic thresholding for re-masking
+            if t == self.num_inference_steps - 1:
+                threshold = 0.0 # 最后一步，无论多不自信，都不要再 Mask 了，保留当前结果
+            else:
+                threshold = 0.1 + 0.6 * (t / (self.num_inference_steps - 1))
             confident = target_conf > threshold
             
             if self.prefix_trie is not None and dead_beam_mask.any():
                 confident = confident & (~dead_beam_mask.unsqueeze(1))
 
-            # 兜底：如果全都不置信，放寬首個位置
+            # Fallback: ensure at least the first position is confident if nothing is
             confident_view = confident.view(batch_size, self.beam_size, target_len)
             prefix_lens_view = (prefix_lens.view(batch_size, self.beam_size) if prefix_lens is not None else None)
             
@@ -301,7 +438,7 @@ class AdaDiff(AbstractModel):
 
             expanded_ids[:, target_start:] = new_target
 
-        # 5) 最終打分 (Refinement + Reranking)
+        # 5) Final Scoring (Refinement + Reranking)
         final_outputs = self.backbone(
             input_ids=expanded_ids,
             attention_mask=expanded_mask,
@@ -309,10 +446,18 @@ class AdaDiff(AbstractModel):
         )
         final_target_logits = final_outputs.logits[:, target_start:, :]
         
+        # Apply the same penalty to final scoring if needed (Consistency)
         prefix_target = prefix_mask[:, target_start:target_start + target_len].repeat(batch_size * self.beam_size, 1)
+        
+        # NOTE: For final reranking, we usually rely on lambda_div (MMR-style), 
+        # but you can also include the Energy term here if you want consistency.
+        # Below is using lambda_div (Rerank config)
         guided_final_logits = final_target_logits - self.lambda_div * expanded_penalty.unsqueeze(1) * prefix_target.unsqueeze(-1)
         guided_final_logits = guided_final_logits.masked_fill(~self.level_token_mask, mask_value)
 
+        # ... (The rest of the function remains unchanged: decoding, reranking, metrics) ...
+        # (Copy the remaining part from your original code starting from "# 最終解碼 (帶 Trie 約束)")
+        
         # 最終解碼 (帶 Trie 約束)
         decode_dead_mask = dead_beam_mask.clone()
         if self.prefix_trie is not None:
@@ -471,8 +616,12 @@ class AdaDiff(AbstractModel):
             metrics[f"NDCG@{k}"] = ndcg_at_k(pos_index, k).sum().item()
 
         # 計算多樣性指標
+        # 计算多樣性指標
         if self.code_to_item_map and self.item_category_tensor.numel() > 0:
-            top_beams = max(1, min(self.diversity_topk, self.beam_size))
+            # [Fix] 解耦评估深度。强制评估 Top-10 或 Beam Size (取小者)
+            # 这样即使 diversity_topk=0 (关闭重排)，我们依然能看到 @10 的多样性指标
+            metric_k = 10 
+            top_beams = max(1, min(metric_k, self.beam_size))
             base_map = self.item_category_tensor.to(device)
 
             beam_items = torch.full((batch_size, self.beam_size), -1, device=device, dtype=torch.long)
@@ -524,6 +673,19 @@ class AdaDiff(AbstractModel):
                     metrics[f"SCD@{top_beams}"] = scd_sum
                     metrics[f"WSCD@{top_beams}"] = wscd_sum
                     metrics[f"_valid_SCD@{top_beams}"] = scd_cnt
+
+        # [新增诊断代码]
+        # 检查 Level-1 (Category) 是否预测正确
+        # target_codes: [Batch, 4] -> 取第0列
+        target_l1 = target_codes[:, 0].unsqueeze(1)  # [B, 1]
+        # final_preds: [Batch, Beam, 4] -> 取第0列
+        pred_l1 = final_preds[:, :, 0]               # [B, Beam]
+        
+        # 只要 Beam 中有一个命中了 Target 的 L1
+        l1_hit_matrix = (pred_l1 == target_l1) # [B, Beam]
+        
+        metrics["L1_Hit@1"] = l1_hit_matrix[:, 0].float().mean().item() # Top-1 命中率
+        metrics["L1_Hit@Beam"] = l1_hit_matrix.any(dim=1).float().mean().item() # Beam 命中率
 
         return metrics
 
@@ -685,6 +847,18 @@ class AdaDiff(AbstractModel):
         preds = preds[..., :label_len]
         labels_expanded = labels.expand(-1, preds.shape[1], -1)
         return (preds == labels_expanded).all(dim=-1)
+
+    @staticmethod
+    def _align_layer_weights(weights: List[float], code_len: int) -> List[float]:
+        """Pad or truncate layer weights to match code_len."""
+        if len(weights) == code_len:
+            return weights
+        if len(weights) > code_len:
+            return weights[:code_len]
+        if not weights:
+            weights = [1.0]
+        last = weights[-1]
+        return weights + [last] * (code_len - len(weights))
 
     @staticmethod
     def _build_item_cate_maps(item_to_cate_map: Optional[Dict[int, Any]], item_to_code_map: Optional[Dict[int, List[int]]]) -> Tuple[Dict[int, Any], Dict[int, List[Any]]]:
