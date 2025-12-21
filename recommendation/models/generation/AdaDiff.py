@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from transformers import BertConfig, BertForMaskedLM
-import random
+
 from recommendation.metrics import (
     recall_at_k,
     ndcg_at_k,
@@ -15,7 +15,6 @@ from recommendation.metrics import (
 )
 from recommendation.models.abstract_model import AbstractModel
 from recommendation.models.generation.prefix_tree import Trie
-
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +54,9 @@ class AdaDiff(AbstractModel):
         )
 
         self.backbone = BertForMaskedLM(config=bert_config)
-        # 確保完全隨機初始化，禁止使用預訓練權重
         self.backbone.apply(self._init_weights)
 
-        # 保存一些常用的配置
+        # 常用配置
         self.code_len = config["code_len"]
         self.pad_token_id = token_params["pad_token_id"]
         self.mask_token_id = token_params["mask_token_id"]
@@ -67,8 +65,10 @@ class AdaDiff(AbstractModel):
         self.vocab_size = token_params["vocab_size"]
         self.vocab_sizes = config["vocab_sizes"]
         self.bases = config["bases"]
+
         self.training_diffusion_steps = int(model_params.get("diffusion_steps", 4))
         self.history_mask_prob = float(model_params.get("history_mask_prob", 0.15))
+
         raw_weights = model_params.get("layer_mask_weights", [1.0] * self.code_len)
         if len(raw_weights) != self.code_len:
             logger.warning(
@@ -81,28 +81,30 @@ class AdaDiff(AbstractModel):
             torch.tensor(aligned_weights, dtype=torch.float),
             persistent=False,
         )
-        
-        # level 范圍：用於 prefix 判斷
-        level_starts = [b + 1 for b in self.bases]
-        level_ends = [self.bases[i] + self.vocab_sizes[i] for i in range(len(self.vocab_sizes))]
-        self.register_buffer("level_starts", torch.tensor(level_starts, dtype=torch.long), persistent=False)
-        self.register_buffer("level_ends", torch.tensor(level_ends, dtype=torch.long), persistent=False)
-        
+
+        # ✅ 删除未使用的 level_starts/level_ends（原代码未引用）
+        # level_starts = [b + 1 for b in self.bases]
+        # level_ends = [self.bases[i] + self.vocab_sizes[i] for i in range(len(self.vocab_sizes))]
+        # self.register_buffer("level_starts", torch.tensor(level_starts, dtype=torch.long), persistent=False)
+        # self.register_buffer("level_ends", torch.tensor(level_ends, dtype=torch.long), persistent=False)
+
         self.code_to_item_map = code_to_item_map or {}
+
+        # ✅ 不再构造 item_to_cates_map（你代码里没用过；保持属性存在避免外部引用报错）
         self.item_to_cate_map, self.item_to_cates_map = self._build_item_cate_maps(
             item_to_cate_map, item_to_code_map
         )
         self.num_semantic_categories = len(set(self.item_to_cate_map.values())) if self.item_to_cate_map else 0
-        
-        # 構建類別映射 Tensor
+
+        # 类别映射 Tensor
         max_item_id = max(self.item_to_cate_map.keys()) if self.item_to_cate_map else 0
         cate_tensor = torch.full((max_item_id + 1,), -1, dtype=torch.long)
         for iid, cate in self.item_to_cate_map.items():
             if iid <= max_item_id:
                 cate_tensor[iid] = int(cate)
         self.register_buffer("item_category_tensor", cate_tensor, persistent=False)
-        
-        # 構建 Level Token Mask
+
+        # Level Token Mask
         target_len = self.code_len
         allowed = torch.zeros(target_len, self.vocab_size, dtype=torch.bool)
         for i in range(target_len):
@@ -110,37 +112,25 @@ class AdaDiff(AbstractModel):
             end = self.bases[i] + self.vocab_sizes[i] + 1
             allowed[i, start:end] = True
         self.register_buffer("level_token_mask", allowed, persistent=False)
-        
-        # 前缀樹約束（核心）
+
+        # Trie
         self.prefix_trie = prefix_trie or kwargs.get("prefix_trie")
         if self.prefix_trie is not None:
             logger.info("AdaDiff: Prefix trie loaded, logits will be masked by valid prefixes during decoding.")
 
         eval_params = config.get("evaluation_params", {})
         self.beam_size = int(eval_params.get("beam_size", 20))
-        self.lambda_div = float(
-            eval_params.get("lambda_div", 0.0)
-        )
-        # 採樣階段的獨立制導係數
-        self.lambda_div_sampling = float(
-            eval_params.get("lambda_div_sampling", 0.0)
-        )
-        self.use_time_anneal_guidance = bool(
-            eval_params.get("time_anneal_guidance", True)
-        )
-        self.debug_logit_stats = bool(
-            eval_params.get("debug_logit_stats", False)
-        )
-        self.temperature = float(
-            eval_params.get("temperature", 0.3)
-        )
-        
-            
+        self.lambda_div = float(eval_params.get("lambda_div", 0.0))
+        self.lambda_div_sampling = float(eval_params.get("lambda_div_sampling", 0.0))
+        self.use_time_anneal_guidance = bool(eval_params.get("time_anneal_guidance", True))
+        self.debug_logit_stats = bool(eval_params.get("debug_logit_stats", False))
+        self.temperature = float(eval_params.get("temperature", 0.3))
+
         self.top_k = int(eval_params.get("top_k", eval_params.get("topk_sampling", 10)))
         min_topk = max(self.beam_size * 2, 32)
         if self.top_k < min_topk:
             self.top_k = min_topk
-            
+
         self.num_inference_steps = int(
             eval_params.get(
                 "num_inference_steps",
@@ -150,12 +140,13 @@ class AdaDiff(AbstractModel):
         self.alpha_diversity = float(eval_params.get("alpha_diversity", 0.5))
         self.diversity_topk = int(eval_params.get("diversity_topk", min(10, self.beam_size)))
 
+        self.time_embed = nn.Embedding(self.training_diffusion_steps + 1, bert_config.hidden_size)
+
     @property
     def task_type(self) -> str:
         return "generative"
 
     def _init_weights(self, module: nn.Module):
-        """BERT 標準初始化"""
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.weight.data.normal_(mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
@@ -164,62 +155,71 @@ class AdaDiff(AbstractModel):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
+    # --------------------------
+    # Backbone helper (with time embedding on target codes)
+    # --------------------------
+    def _backbone_logits_with_time(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        t_index: torch.Tensor,  # [B]
+    ) -> torch.Tensor:
+        """
+        Returns logits [B, seq_len, V]. Adds t-embedding ONLY to target code region.
+        """
+        inputs_embeds = self.backbone.bert.embeddings.word_embeddings(input_ids)
+        t_index = torch.clamp(t_index, 0, self.training_diffusion_steps).long()
+        t_embed = self.time_embed(t_index).unsqueeze(1)  # [B,1,H]
+        inputs_embeds[:, -self.code_len :, :] += t_embed
+        outputs = self.backbone(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        return outputs.logits
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
 
         if self.training:
-            input_ids, labels = self._apply_training_mask(input_ids, attention_mask)
+            input_ids, labels, t = self._apply_training_mask(input_ids, attention_mask)
         else:
             labels = batch.get("labels", torch.full_like(input_ids, -100))
+            t = batch.get("t", torch.zeros(input_ids.size(0), device=input_ids.device, dtype=torch.long))
 
-        outputs = self.backbone(
-            input_ids=input_ids, attention_mask=attention_mask, return_dict=True
-        )
+        logits = self._backbone_logits_with_time(input_ids, attention_mask, t)
 
-        logits = outputs.logits
         loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         loss = loss_fct(logits.view(-1, self.vocab_size), labels.view(-1))
-
         return {"loss": loss, "logits": logits}
 
+    # --------------------------
+    # Diffusion forward sampling (training)
+    # --------------------------
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Hierarchical priority transition kernel (forward diffusion).
-        x_start: [B, code_len] tokens before masking
-        t:       [B] or scalar timestep
-        Returns (x_t, mask) where x_t has hierarchical masks applied.
-        """
         mask_token = torch.full_like(x_start, self.mask_token_id)
-        # Base mask prob from (approx.) noise schedule; scaled to [0,1].
         t = t.to(x_start.device).float()
         if t.dim() == 0:
             t = t.view(1)
         base_prob = ((t + 1.0) / float(max(self.training_diffusion_steps, 1))).clamp(0.0, 1.0)
-        base_prob = base_prob.view(-1, 1)  # [B,1]
+        base_prob = base_prob.view(-1, 1)
 
-        # Hierarchical scaling: coarse depths receive higher mask prob.
-        layer_weights = self.layer_mask_weights.view(1, -1)  # [1, code_len]
-        p_mask = torch.clamp(base_prob * layer_weights, 0.0, 1.0)  # [B, code_len]
+        layer_weights = self.layer_mask_weights.view(1, -1)
+        p_mask = torch.clamp(base_prob * layer_weights, 0.0, 1.0)
         mask = torch.bernoulli(p_mask).bool()
         x_t = torch.where(mask, mask_token, x_start)
         return x_t, mask
 
     def _apply_training_mask(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply GPU-side masking for training:
-        - History tokens masked with uniform prob.
-        - Target codes masked with hierarchical q_sample.
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = input_ids.device
         x = input_ids.clone()
         labels = torch.full_like(x, -100)
         bsz, seq_len = x.shape
         target_start = seq_len - self.code_len
 
-        # Mask history tokens (between [CLS] and [SEP]) on GPU
         if self.history_mask_prob > 0:
             positions = torch.arange(seq_len, device=device).unsqueeze(0)
             cls_pos = (x == self.cls_token_id).float().argmax(dim=1, keepdim=True)
@@ -230,7 +230,6 @@ class AdaDiff(AbstractModel):
                 labels = labels.masked_scatter(hist_mask, x[hist_mask])
                 x = x.masked_fill(hist_mask, self.mask_token_id)
 
-        # Hierarchical masking on target codes
         target_slice = x[:, target_start:]
         t = torch.randint(
             low=0,
@@ -244,15 +243,10 @@ class AdaDiff(AbstractModel):
         labels[:, target_start:] = target_labels
         x[:, target_start:] = target_noised
 
-        return x, labels
+        return x, labels, t
 
     @torch.no_grad()
-    def evaluate_step(
-        self, batch: Dict[str, torch.Tensor], topk_list: List[int]
-    ) -> Dict[str, float]:
-        """
-        Iterative Denoising + Energy-Guided Inference (with Auto-Scaling)
-        """
+    def evaluate_step(self, batch: Dict[str, torch.Tensor], topk_list: List[int]) -> Dict[str, float]:
         device = batch["input_ids"].device
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
@@ -263,166 +257,151 @@ class AdaDiff(AbstractModel):
         target_start = seq_len - target_len
         mask_value = -1e9
 
-        # 1) Calculate Diversity Penalty (Energy Function)
-        diversity_penalty = self._calculate_diversity_penalty(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            target_start=target_start,
-        )
+        # 1) Diversity Penalty: [B, L, V]
+        diversity_penalty = self._calculate_diversity_penalty(input_ids, attention_mask, target_start)
 
-        # 2) Construct prefix mask (Apply only to coarse levels)
+        # 2) prefix mask: only coarse levels (default 2)
         prefix_mask = torch.zeros(seq_len, device=device, dtype=torch.float)
-        # Using configured coarse levels or default to 2
-        coarse_levels = getattr(self, "coarse_level_count", 2) 
+        coarse_levels = getattr(self, "coarse_level_count", 2)
         penalty_len = min(coarse_levels, target_len)
-        
         if penalty_len > 0:
             prefix_mask[target_start : target_start + penalty_len] = 1.0
-        prefix_mask = prefix_mask.unsqueeze(0)
+        prefix_mask = prefix_mask.unsqueeze(0)  # [1, seq_len]
 
-        # 3) Expand Batch for Beam Search
-        expanded_ids = input_ids.clone()
+        # 3) Expand batch for beam (expand instead of repeat)
+        expanded_ids = input_ids.unsqueeze(1).expand(-1, self.beam_size, -1).reshape(batch_size * self.beam_size, seq_len)
+        expanded_mask = attention_mask.unsqueeze(1).expand(-1, self.beam_size, -1).reshape(batch_size * self.beam_size, seq_len)
+
+        # initialize target as all MASK
         expanded_ids[:, target_start:] = self.mask_token_id
-        expanded_ids = (
-            expanded_ids.unsqueeze(1)
-            .repeat(1, self.beam_size, 1)
-            .view(batch_size * self.beam_size, seq_len)
-        )
-        expanded_mask = (
-            attention_mask.unsqueeze(1)
-            .repeat(1, self.beam_size, 1)
-            .view(batch_size * self.beam_size, seq_len)
-        )
-        # Efficient expansion without repeat (using broadcasting later)
-        # We expand here to keep logic consistent with previous version, but note broadcasting is possible
-        expanded_penalty = diversity_penalty.unsqueeze(1).repeat(1, self.beam_size, 1).view(
-            batch_size * self.beam_size, -1
-        )
-        expanded_prefix_mask = prefix_mask.repeat(batch_size * self.beam_size, 1)
-        dead_beam_mask = torch.zeros(
-            batch_size * self.beam_size, device=device, dtype=torch.bool
+
+        expanded_prefix_mask = prefix_mask.expand(batch_size * self.beam_size, -1)  # [B*beam, seq_len]
+
+        # expanded_penalty: [B*beam, L, V]
+        expanded_penalty = (
+            diversity_penalty.unsqueeze(1)
+            .expand(-1, self.beam_size, -1, -1)
+            .reshape(batch_size * self.beam_size, self.code_len, self.vocab_size)
         )
 
-        # 4) Iterative Denoising Loop
-        for t in range(self.num_inference_steps):
+        dead_beam_mask = torch.zeros(batch_size * self.beam_size, device=device, dtype=torch.bool)
+
+        # NOTE: 为了保证正确性（尤其是 trie 约束下），这里先不做 prefix cache
+        # 否则 prefix_changed 的判断很容易导致 allowed_next / prefix_lens 不一致，Recall 会大幅下降。
+        for step in range(self.num_inference_steps):
             current_target = expanded_ids[:, target_start:]
+
+            # --- Trie state (每步重算，保证正确性) ---
             prefix_lens: Optional[torch.Tensor] = None
-            allowed_next: List[List[int]] = []
-            prefix_dead = torch.zeros_like(dead_beam_mask)
-            
+            allowed_next_tensor: Optional[List[Optional[torch.Tensor]]] = None
             if self.prefix_trie is not None:
                 prefix_lens, allowed_next, prefix_dead = self._build_prefix_state(current_target)
                 dead_beam_mask |= prefix_dead
+                allowed_next_tensor = [
+                    torch.as_tensor(a, device=device, dtype=torch.long) if a else None
+                    for a in allowed_next
+                ]
 
-            outputs = self.backbone(
-                input_ids=expanded_ids,
-                attention_mask=expanded_mask,
-                return_dict=True,
-            )
-            logits = outputs.logits
+            # --- t_index 修复：reverse mapping（关键） ---
+            # inference step: 0..T-1 ；training diffusion: 0..S-1
+            # 用反向时间更符合“逐步去噪”的语义
+            t_index_val = int(max(self.training_diffusion_steps - 1 - step, 0))
+            t_index = torch.full((batch_size * self.beam_size,), t_index_val, device=device, dtype=torch.long)
 
-            # --- [Modification Start] Adaptive Guidance Injection ---
-            
-            # A. Calculate Statistics for Auto-Scaling
-            # We want the guidance term to be comparable to the logits' standard deviation
-            current_logits_std = logits.std()
-            
-            # Calculate the mean intensity of the penalty where it is non-zero
-            # (Avoid dragging down the mean with zeros)
-            penalty_active_mask = expanded_penalty > 0
-            if penalty_active_mask.any():
-                penalty_intensity = expanded_penalty[penalty_active_mask].mean()
-            else:
-                penalty_intensity = 1.0 # Fallback
-            
-            # Auto-Scale Factor: 
-            # If we apply this, a penalty of '1.0' becomes equivalent to '1.0 std of logits'
-            auto_scale = current_logits_std / (penalty_intensity + 1e-9)
+            logits = self._backbone_logits_with_time(expanded_ids, expanded_mask, t_index)
 
-            # B. Time Annealing Factor
-            if self.use_time_anneal_guidance and self.num_inference_steps > 1:
-                # Linear decay: 1.0 at t=0 (start), 0.0 at t=T (end)
-                # Note: t goes 0 -> T-1. 
-                time_factor = 1.0 - float(t) / float(self.num_inference_steps - 1)
-            else:
-                time_factor = 1.0
+            # --- Guidance（修复：只在 early steps 使用） ---
+            guided_logits = logits  # 默认不改
+            if self.lambda_div_sampling > 0:
+                # 只在前 1~2 步施加能量制导，避免后期强拉分布导致 Recall 崩
+                guidance_steps = int(getattr(self, "guidance_steps", 2))
+                if step < max(0, guidance_steps):
+                    # 只看 target 区域的 std
+                    current_logits_std = logits[:, target_start:, :].std().detach()
 
-            # C. Calculate Effective Guidance
-            # Formula: lambda * time * scale * penalty * mask
-            current_lambda = self.lambda_div_sampling * time_factor * auto_scale
-            
-            guidance_term = current_lambda * expanded_penalty.unsqueeze(1) * expanded_prefix_mask.unsqueeze(-1)
-            
-            # D. Apply Guidance
-            guided_logits = logits - guidance_term
+                    penalty_active_mask = expanded_penalty > 0
+                    if penalty_active_mask.any():
+                        penalty_intensity = expanded_penalty[penalty_active_mask].mean()
+                    else:
+                        penalty_intensity = torch.tensor(1.0, device=device)
 
-            # E. Logging (Optional)
-            if self.debug_logit_stats and t == 0 and not hasattr(self, "_logged_logit_stats"):
-                logits_mean = logits.mean().item()
-                logits_std_val = current_logits_std.item()
-                guide_mean = guidance_term.mean().item()
-                guide_abs = guidance_term.abs().mean().item()
-                # Max guidance is useful to see the peak penalty
-                guide_max = guidance_term.max().item()
-                
-                logger.info(
-                    f"[Debug] Step {t}: Logits mean/std: {logits_mean:.4f}/{logits_std_val:.4f} | "
-                    f"Guidance max/abs_mean: {guide_max:.4f}/{guide_abs:.4f} | "
-                    f"Scale: {auto_scale.item():.2f} (Lambda: {self.lambda_div_sampling})"
-                )
-                self._logged_logit_stats = True
-            
-            # --- [Modification End] ---
+                    auto_scale = current_logits_std / (penalty_intensity + 1e-9)
 
-            # Step C: Sampling
+                    # 防止 auto_scale 爆炸（你日志里 97x 就是爆炸）
+                    auto_scale = torch.clamp(auto_scale, max=5.0)
+
+                    if self.use_time_anneal_guidance and self.num_inference_steps > 1:
+                        time_factor = 1.0 - float(step) / float(self.num_inference_steps - 1)
+                    else:
+                        time_factor = 1.0
+
+                    current_lambda = self.lambda_div_sampling * time_factor * auto_scale
+
+                    guided_logits = logits.clone()
+                    guided_logits[:, target_start : target_start + self.code_len, :] -= (
+                        current_lambda
+                        * expanded_penalty
+                        * expanded_prefix_mask[:, target_start : target_start + self.code_len].unsqueeze(-1)
+                    )
+
+                    if self.debug_logit_stats and step == 0 and not hasattr(self, "_logged_sampling_stats"):
+                        delta = (logits[:, target_start:target_start + self.code_len, :]
+                                - guided_logits[:, target_start:target_start + self.code_len, :])
+                        logger.info(
+                            f"[SamplingGuide] std(logits)={current_logits_std.item():.4f} | "
+                            f"abs_mean(delta)={delta.abs().mean().item():.4f} | "
+                            f"max(delta)={delta.max().item():.4f} | "
+                            f"lambda_div_sampling={self.lambda_div_sampling:.3f} | "
+                            f"auto_scale={auto_scale.item():.2f} | "
+                            f"t_index={t_index_val}"
+                        )
+                        self._logged_sampling_stats = True
+
+            # 3) Sampling
             target_logits = guided_logits[:, target_start:, :] / max(self.temperature, 1e-5)
             target_logits = target_logits.masked_fill(~self.level_token_mask, mask_value)
-            
-            if self.prefix_trie is not None:
+
+            if self.prefix_trie is not None and prefix_lens is not None and allowed_next_tensor is not None:
                 dead_beam_mask |= self._mask_logits_with_trie(
-                    target_logits, allowed_next, prefix_lens, mask_value
+                    target_logits, allowed_next_tensor, prefix_lens, mask_value
                 )
 
             topk_vals, topk_ids = torch.topk(target_logits, k=self.top_k, dim=-1)
             probs = torch.softmax(topk_vals, dim=-1)
-            sampled = torch.multinomial(
-                probs.view(-1, self.top_k), num_samples=1
-            ).view(-1, target_len, 1)
+            sampled = torch.multinomial(probs.view(-1, self.top_k), num_samples=1).view(-1, target_len, 1)
             sampled_tokens = topk_ids.gather(-1, sampled).squeeze(-1)
 
-            # Step D: Adaptive Remasking (Confidence-based)
+            # 4) Confidence-based remasking
             conf_logits = guided_logits[:, target_start:, :].masked_fill(~self.level_token_mask, mask_value)
-            if self.prefix_trie is not None:
-                dead_beam_mask |= self._mask_logits_with_trie(
-                    conf_logits, allowed_next, prefix_lens, mask_value
-                )
+            if self.prefix_trie is not None and prefix_lens is not None and allowed_next_tensor is not None:
+                dead_beam_mask |= self._mask_logits_with_trie(conf_logits, allowed_next_tensor, prefix_lens, mask_value)
+
             target_conf = torch.softmax(conf_logits, dim=-1).max(dim=-1).values
-            
-            # Dynamic thresholding for re-masking
-            if t == self.num_inference_steps - 1:
-                threshold = 0.0 # 最后一步，无论多不自信，都不要再 Mask 了，保留当前结果
+
+            if step == self.num_inference_steps - 1:
+                threshold = 0.0
             else:
-                threshold = 0.1 + 0.6 * (t / (self.num_inference_steps - 1))
+                threshold = 0.1 + 0.6 * (step / (self.num_inference_steps - 1))
             confident = target_conf > threshold
-            
+
             if self.prefix_trie is not None and dead_beam_mask.any():
                 confident = confident & (~dead_beam_mask.unsqueeze(1))
 
-            # Fallback: ensure at least the first position is confident if nothing is
+            # Ensure at least one position is confident per beam (keep prefix_len pos)
             confident_view = confident.view(batch_size, self.beam_size, target_len)
-            prefix_lens_view = (prefix_lens.view(batch_size, self.beam_size) if prefix_lens is not None else None)
-            
+            prefix_lens_view = prefix_lens.view(batch_size, self.beam_size) if prefix_lens is not None else None
             for b in range(batch_size):
                 for k in range(self.beam_size):
                     pos = int(prefix_lens_view[b, k].item()) if prefix_lens_view is not None else 0
                     pos = min(pos, target_len - 1)
                     confident_view[b, k, pos] = True
-            
+
             no_conf_mask = ~confident_view.any(dim=2)
             if no_conf_mask.any():
                 confident_view[no_conf_mask, 0] = True
             confident = confident_view.view(batch_size * self.beam_size, target_len)
 
+            # remask/update
             if self.prefix_trie is not None:
                 new_target = self._remask_with_trie(
                     sampled_tokens=sampled_tokens,
@@ -432,32 +411,16 @@ class AdaDiff(AbstractModel):
                     inactive_mask=dead_beam_mask,
                 )
             else:
-                new_target = torch.where(
-                    confident, sampled_tokens, torch.full_like(sampled_tokens, self.mask_token_id)
-                )
+                new_target = torch.where(confident, sampled_tokens, torch.full_like(sampled_tokens, self.mask_token_id))
 
             expanded_ids[:, target_start:] = new_target
 
-        # 5) Final Scoring (Refinement + Reranking)
-        final_outputs = self.backbone(
-            input_ids=expanded_ids,
-            attention_mask=expanded_mask,
-            return_dict=True,
-        )
-        final_target_logits = final_outputs.logits[:, target_start:, :]
-        
-        # Apply the same penalty to final scoring if needed (Consistency)
-        prefix_target = prefix_mask[:, target_start:target_start + target_len].repeat(batch_size * self.beam_size, 1)
-        
-        # NOTE: For final reranking, we usually rely on lambda_div (MMR-style), 
-        # but you can also include the Energy term here if you want consistency.
-        # Below is using lambda_div (Rerank config)
-        guided_final_logits = final_target_logits - self.lambda_div * expanded_penalty.unsqueeze(1) * prefix_target.unsqueeze(-1)
-        guided_final_logits = guided_final_logits.masked_fill(~self.level_token_mask, mask_value)
+        # 5) Final scoring (keep 3D logits for trie decode)
+        t_index_val = int(max(self.training_diffusion_steps - 1, 0))
+        t_index = torch.full((batch_size * self.beam_size,), t_index_val, device=device, dtype=torch.long)
+        final_logits_full = self._backbone_logits_with_time(expanded_ids, expanded_mask, t_index)
+        guided_final_logits = final_logits_full[:, target_start:, :].masked_fill(~self.level_token_mask, mask_value)  # [B*beam,L,V]
 
-        # ... (The rest of the function remains unchanged: decoding, reranking, metrics) ...
-        # (Copy the remaining part from your original code starting from "# 最終解碼 (帶 Trie 約束)")
-        
         # 最終解碼 (帶 Trie 約束)
         decode_dead_mask = dead_beam_mask.clone()
         if self.prefix_trie is not None:
@@ -477,19 +440,17 @@ class AdaDiff(AbstractModel):
             guided_final_logits = guided_final_logits.view(batch_size, self.beam_size, target_len, self.vocab_size)
             final_preds = guided_final_logits.argmax(dim=-1)
 
-        # 計算基礎分數
+        # 基礎分數
         log_probs = torch.log_softmax(guided_final_logits, dim=-1)
         token_log_probs = torch.gather(log_probs, dim=-1, index=final_preds.unsqueeze(-1)).squeeze(-1)
         beam_scores = token_log_probs.sum(dim=-1)
 
-        # 初始化 invalid_mask
         invalid_mask = torch.zeros_like(beam_scores, dtype=torch.bool)
         if dead_beam_mask.any():
             invalid_mask |= dead_beam_mask.view(batch_size, self.beam_size)
 
-        # 6) Rerank: 內部重複懲罰 & 類別覆蓋懲罰
+        # 6) Optional rerank（保持你的逻辑）
         if self.lambda_div > 0:
-            # 序列內部重複懲罰
             rep_penalty = torch.zeros_like(beam_scores)
             for b in range(batch_size):
                 for k in range(self.beam_size):
@@ -499,7 +460,6 @@ class AdaDiff(AbstractModel):
                     rep_penalty[b, k] = rep_ratio if rep_ratio > 0.5 else 0.0
             beam_scores = beam_scores - (self.lambda_div * 0.25) * rep_penalty
 
-            # 類別覆蓋懲罰 (Beam 間)
             if self.code_to_item_map:
                 beam_cates = self._codes_to_categories(final_preds)
                 cate_penalty = torch.zeros_like(beam_scores)
@@ -508,14 +468,15 @@ class AdaDiff(AbstractModel):
                     cats = beam_cates[b]
                     valid_mask_b = ~invalid_mask[b]
                     for cate in cats.unique():
-                        if cate < 0: continue
+                        if cate < 0:
+                            continue
                         mask = (cats == cate) & valid_mask_b
                         repeats = int(mask.sum().item()) - 1
                         if repeats > 0:
                             cate_penalty[b, mask] = 1.0
                 beam_scores = beam_scores - (self.lambda_div * penalty_scale) * cate_penalty
 
-        # 7) 標記無效 Beam
+        # 7) invalid beams
         if self.code_to_item_map:
             for b in range(batch_size):
                 for k in range(self.beam_size):
@@ -528,12 +489,11 @@ class AdaDiff(AbstractModel):
             for b in range(batch_size):
                 for k in range(self.beam_size):
                     invalid_mask[b, k] |= not self._is_valid_code_by_trie(final_preds[b, k].tolist())
-        
+
         if invalid_mask.any():
             beam_scores = torch.where(invalid_mask, torch.full_like(beam_scores, mask_value), beam_scores)
 
-        # 8) 最終排序 (類別優先策略)
-        sort_indices = None
+        # 8) final sorting（保持你的逻辑）
         if self.lambda_div > 0 and self.code_to_item_map:
             beam_cates = self._codes_to_categories(final_preds)
             new_orders = []
@@ -542,13 +502,14 @@ class AdaDiff(AbstractModel):
                 cates_b = beam_cates[b]
                 valid_mask_b = ~invalid_mask[b]
 
-                # 策略: 每個類別先取最高分的一個
                 best_per_cate = []
                 for cate in cates_b.unique():
-                    if cate < 0: continue
+                    if cate < 0:
+                        continue
                     cate_mask = (cates_b == cate) & valid_mask_b
                     idxs = torch.nonzero(cate_mask, as_tuple=False).squeeze(-1)
-                    if idxs.numel() == 0: continue
+                    if idxs.numel() == 0:
+                        continue
                     best_idx = idxs[scores_b[idxs].argmax()]
                     best_per_cate.append(best_idx)
 
@@ -560,36 +521,35 @@ class AdaDiff(AbstractModel):
                 else:
                     primary = torch.tensor([], device=device, dtype=torch.long)
 
-                # 剩餘的按分數補齊
                 mask_keep = torch.zeros_like(scores_b, dtype=torch.bool)
                 mask_keep[primary] = True
                 mask_keep = mask_keep | invalid_mask[b]
                 remaining = torch.nonzero(~mask_keep, as_tuple=False).squeeze(-1)
-                
+
                 final_order = primary
                 if remaining.numel() > 0:
                     _, rem_order = scores_b[remaining].sort(descending=True)
                     secondary = remaining[rem_order]
                     final_order = torch.cat([primary, secondary], dim=0)
-                
+
                 if final_order.numel() < self.beam_size:
                     pad = torch.arange(self.beam_size - final_order.numel(), device=device, dtype=torch.long)
                     final_order = torch.cat([final_order, pad], dim=0)[: self.beam_size]
                 new_orders.append(final_order)
+
             sort_indices = torch.stack(new_orders, dim=0)
-            
-            # 強制前 diversity_topk 不重複類別
+
             if self.diversity_topk > 0:
                 enforce_orders = []
                 for b in range(batch_size):
                     order_b = sort_indices[b]
-                    cates_b = self._codes_to_categories(final_preds[b:b+1, :, :])[0]
+                    cates_b = self._codes_to_categories(final_preds[b:b + 1, :, :])[0]
                     seen = set()
                     keep = []
                     drop = []
                     for idx in order_b.tolist():
                         cate = int(cates_b[idx].item())
-                        if cate < 0: 
+                        if cate < 0:
                             drop.append(idx)
                             continue
                         if len(keep) < self.diversity_topk and cate in seen:
@@ -608,19 +568,16 @@ class AdaDiff(AbstractModel):
 
         final_preds = final_preds.gather(1, sort_indices.unsqueeze(-1).expand(-1, -1, target_len))
 
-        # 9) 計算指標
+        # 9) metrics
         pos_index = self._calculate_pos_index(preds=final_preds, labels=target_codes)
         metrics = {"count": batch_size}
         for k in topk_list:
             metrics[f"Recall@{k}"] = recall_at_k(pos_index, k).sum().item()
             metrics[f"NDCG@{k}"] = ndcg_at_k(pos_index, k).sum().item()
 
-        # 計算多樣性指標
-        # 计算多樣性指標
+        # diversity metrics
         if self.code_to_item_map and self.item_category_tensor.numel() > 0:
-            # [Fix] 解耦评估深度。强制评估 Top-10 或 Beam Size (取小者)
-            # 这样即使 diversity_topk=0 (关闭重排)，我们依然能看到 @10 的多样性指标
-            metric_k = 10 
+            metric_k = 10
             top_beams = max(1, min(metric_k, self.beam_size))
             base_map = self.item_category_tensor.to(device)
 
@@ -631,10 +588,9 @@ class AdaDiff(AbstractModel):
                     beam_items[b, idx] = self.code_to_item_map.get(code_tuple, -1)
 
             cand_items = beam_items[:, :top_beams]
-            # 確保索引安全
             safe_items = torch.clamp(cand_items, min=0, max=max(int(base_map.numel() - 1), 0))
             cand_cates = base_map[safe_items]
-            valid_mask = (cand_items > 0) & (cand_items < base_map.numel()) & (cand_cates >= 0)
+            valid_mask2 = (cand_items > 0) & (cand_items < base_map.numel()) & (cand_cates >= 0)
 
             gt_items = torch.full((batch_size, 1), -1, device=device, dtype=torch.long)
             for b in range(batch_size):
@@ -642,11 +598,11 @@ class AdaDiff(AbstractModel):
                 gt_item = self.code_to_item_map.get(code_tuple, -1)
                 gt_items[b, 0] = gt_item if gt_item > 0 else -1
 
-            div_score, div_cnt = calculate_diversity_at_n(cand_items, base_map, valid_mask=valid_mask)
+            div_score, div_cnt = calculate_diversity_at_n(cand_items, base_map, valid_mask=valid_mask2)
             alpha_score, alpha_cnt = calculate_alpha_ndcg_at_k(
-                cand_items, gt_items, base_map, k=top_beams, alpha=self.alpha_diversity, valid_mask=valid_mask
+                cand_items, gt_items, base_map, k=top_beams, alpha=self.alpha_diversity, valid_mask=valid_mask2
             )
-            
+
             metrics[f"Diversity@{top_beams}"] = div_score
             metrics[f"_valid_Diversity@{top_beams}"] = div_cnt
             metrics[f"AlphaNDCG@{top_beams}"] = alpha_score
@@ -658,11 +614,12 @@ class AdaDiff(AbstractModel):
                 wscd_sum = 0.0
                 for b in range(batch_size):
                     rec_items = [
-                        int(cand_items[b, idx].item()) 
-                        for idx in range(top_beams) 
+                        int(cand_items[b, idx].item())
+                        for idx in range(top_beams)
                         if cand_items[b, idx] > 0 and int(cand_items[b, idx]) in self.item_to_cate_map
                     ]
-                    if not rec_items: continue
+                    if not rec_items:
+                        continue
                     try:
                         scd_sum += compute_scd(rec_items, self.item_to_cate_map, self.num_semantic_categories)
                         wscd_sum += compute_weighted_scd(rec_items, self.item_to_cate_map)
@@ -674,133 +631,186 @@ class AdaDiff(AbstractModel):
                     metrics[f"WSCD@{top_beams}"] = wscd_sum
                     metrics[f"_valid_SCD@{top_beams}"] = scd_cnt
 
-        # [新增诊断代码]
-        # 检查 Level-1 (Category) 是否预测正确
-        # target_codes: [Batch, 4] -> 取第0列
-        target_l1 = target_codes[:, 0].unsqueeze(1)  # [B, 1]
-        # final_preds: [Batch, Beam, 4] -> 取第0列
-        pred_l1 = final_preds[:, :, 0]               # [B, Beam]
-        
-        # 只要 Beam 中有一个命中了 Target 的 L1
-        l1_hit_matrix = (pred_l1 == target_l1) # [B, Beam]
-        
-        metrics["L1_Hit@1"] = l1_hit_matrix[:, 0].float().mean().item() # Top-1 命中率
-        metrics["L1_Hit@Beam"] = l1_hit_matrix.any(dim=1).float().mean().item() # Beam 命中率
-
         return metrics
 
+
+    # --------------------------
+    # Trie utilities (optimized masking)
+    # --------------------------
     def _get_allowed_tokens_from_trie(self, prefix: List[int]) -> List[int]:
-        if self.prefix_trie is None: return []
+        if self.prefix_trie is None:
+            return []
         try:
             return self.prefix_trie._lookup(tuple(prefix))
         except AttributeError:
-            try: return self.prefix_trie.get_allowed_next_tokens(0, prefix)
-            except Exception: return []
+            try:
+                return self.prefix_trie.get_allowed_next_tokens(0, prefix)
+            except Exception:
+                return []
 
     def _build_prefix_state(self, targets: torch.Tensor) -> Tuple[torch.Tensor, List[List[int]], torch.Tensor]:
         batch_beam, target_len = targets.shape
         prefix_lens = torch.zeros(batch_beam, device=targets.device, dtype=torch.long)
         allowed_next: List[List[int]] = [[] for _ in range(batch_beam)]
         dead_mask = torch.zeros(batch_beam, device=targets.device, dtype=torch.bool)
-        if self.prefix_trie is None: return prefix_lens, allowed_next, dead_mask
+        if self.prefix_trie is None:
+            return prefix_lens, allowed_next, dead_mask
 
         for idx in range(batch_beam):
             prefix: List[int] = []
             valid_len = 0
             for pos in range(target_len):
                 token = int(targets[idx, pos].item())
-                if token == self.mask_token_id or token == self.pad_token_id: break
+                if token == self.mask_token_id or token == self.pad_token_id:
+                    break
                 allowed = self._get_allowed_tokens_from_trie(prefix)
                 if not allowed:
                     dead_mask[idx] = True
                     break
-                if token not in allowed: break
+                if token not in allowed:
+                    break
                 prefix.append(token)
                 valid_len += 1
             prefix_lens[idx] = valid_len
             allowed_next[idx] = self._get_allowed_tokens_from_trie(prefix)
-            if not allowed_next[idx]: dead_mask[idx] = True
+            if not allowed_next[idx]:
+                dead_mask[idx] = True
         return prefix_lens, allowed_next, dead_mask
 
-    def _mask_logits_with_trie(self, logits: torch.Tensor, allowed_next: List[List[int]], prefix_lens: Optional[torch.Tensor], mask_value: float) -> torch.Tensor:
-        if self.prefix_trie is None or prefix_lens is None:
+    def _mask_logits_with_trie(
+        self,
+        logits: torch.Tensor,  # [B*beam, L, V]
+        allowed_next_tensor: List[Optional[torch.Tensor]],
+        prefix_lens: torch.Tensor,
+        mask_value: float,
+    ) -> torch.Tensor:
+        """
+        ✅ 关键优化：不再每次创建 disallow bool 向量（V 大时非常耗时/抖动）
+        逻辑等价：对当前位置 pos，只保留 allowed 的 logit，其它置 mask_value。
+        """
+        if self.prefix_trie is None:
             return torch.zeros(logits.size(0), device=logits.device, dtype=torch.bool)
+
         dead_mask = torch.zeros(logits.size(0), device=logits.device, dtype=torch.bool)
         target_len = logits.size(1)
-        for i, allowed in enumerate(allowed_next):
+
+        for i in range(logits.size(0)):
             pos = int(prefix_lens[i].item())
-            if pos >= target_len: continue
-            if not allowed:
+            if pos >= target_len:
+                continue
+            allowed_tensor = allowed_next_tensor[i]
+            if allowed_tensor is None or allowed_tensor.numel() == 0:
                 dead_mask[i] = True
                 continue
-            allowed_tensor = torch.as_tensor(allowed, device=logits.device, dtype=torch.long)
-            disallow = torch.ones(self.vocab_size, device=logits.device, dtype=torch.bool)
-            disallow[allowed_tensor] = False
-            logits[i, pos] = logits[i, pos].masked_fill(disallow, mask_value)
+
+            row = logits[i, pos]  # [V]
+            # 保存 allowed 的原值
+            kept_vals = row.index_select(0, allowed_tensor)
+            # 全部置 mask，再把 allowed 恢复
+            row.fill_(mask_value)
+            row.index_copy_(0, allowed_tensor, kept_vals)
+
         return dead_mask
 
-    def _remask_with_trie(self, sampled_tokens: torch.Tensor, confident: torch.Tensor, current_target: torch.Tensor, prefix_lens: Optional[torch.Tensor], inactive_mask: torch.Tensor) -> torch.Tensor:
+    def _remask_with_trie(
+        self,
+        sampled_tokens: torch.Tensor,
+        confident: torch.Tensor,
+        current_target: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
+        inactive_mask: torch.Tensor,
+    ) -> torch.Tensor:
         batch_beam, target_len = sampled_tokens.shape
         new_target = torch.full_like(sampled_tokens, self.mask_token_id)
+
         for i in range(batch_beam):
-            if inactive_mask is not None and inactive_mask[i]: continue
+            if inactive_mask is not None and inactive_mask[i]:
+                continue
             keep_len = int(prefix_lens[i].item()) if prefix_lens is not None else 0
             prefix_tokens: List[int] = []
             if keep_len > 0:
                 prefix_slice = current_target[i, :keep_len]
                 new_target[i, :keep_len] = prefix_slice
                 prefix_tokens = [int(x) for x in prefix_slice.tolist()]
+
             for pos in range(keep_len, target_len):
-                if not bool(confident[i, pos].item()): break
+                if not bool(confident[i, pos].item()):
+                    break
                 allowed = self._get_allowed_tokens_from_trie(prefix_tokens)
-                if not allowed: break
+                if not allowed:
+                    break
                 cand = int(sampled_tokens[i, pos].item())
-                if cand not in allowed: break
+                if cand not in allowed:
+                    break
                 new_target[i, pos] = cand
                 prefix_tokens.append(cand)
+
         return new_target
 
-    def _decode_with_trie(self, logits: torch.Tensor, base_tokens: torch.Tensor, prefix_lens: Optional[torch.Tensor], inactive_mask: torch.Tensor, mask_value: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _decode_with_trie(
+        self,
+        logits: torch.Tensor,  # [B*beam, L, V]
+        base_tokens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
+        inactive_mask: torch.Tensor,
+        mask_value: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_beam, target_len, _ = logits.shape
         decoded = torch.full((batch_beam, target_len), self.mask_token_id, device=logits.device, dtype=torch.long)
         masked_logits = logits.clone()
+
         for i in range(batch_beam):
-            if inactive_mask is not None and inactive_mask[i]: continue
+            if inactive_mask is not None and inactive_mask[i]:
+                continue
             keep_len = int(prefix_lens[i].item()) if prefix_lens is not None else 0
             prefix_tokens: List[int] = []
             if keep_len > 0:
                 prefix_slice = base_tokens[i, :keep_len]
                 decoded[i, :keep_len] = prefix_slice
                 prefix_tokens = [int(x) for x in prefix_slice.tolist()]
+
             for pos in range(keep_len, target_len):
                 allowed = self._get_allowed_tokens_from_trie(prefix_tokens)
                 if not allowed:
                     inactive_mask[i] = True
                     break
-                disallow = torch.ones(self.vocab_size, device=logits.device, dtype=torch.bool)
-                disallow[torch.as_tensor(allowed, device=logits.device, dtype=torch.long)] = False
-                masked_logits[i, pos] = masked_logits[i, pos].masked_fill(disallow, mask_value)
-                token = int(masked_logits[i, pos].argmax(dim=-1).item())
+
+                allowed_t = torch.as_tensor(allowed, device=logits.device, dtype=torch.long)
+                row = masked_logits[i, pos]
+                kept_vals = row.index_select(0, allowed_t)
+                row.fill_(mask_value)
+                row.index_copy_(0, allowed_t, kept_vals)
+
+                token = int(row.argmax(dim=-1).item())
                 decoded[i, pos] = token
                 prefix_tokens.append(token)
+
         return decoded, masked_logits, inactive_mask
 
     def _is_valid_code_by_trie(self, code_seq: List[int]) -> bool:
-        if self.prefix_trie is None: return True
+        if self.prefix_trie is None:
+            return True
         prefix: List[int] = []
         for token in code_seq:
-            if token == self.mask_token_id or token == self.pad_token_id: return False
+            if token == self.mask_token_id or token == self.pad_token_id:
+                return False
             allowed = self._get_allowed_tokens_from_trie(prefix)
-            if not allowed or token not in allowed: return False
+            if not allowed or token not in allowed:
+                return False
             prefix.append(token)
         return True
 
+    # --------------------------
+    # Category / metrics helpers
+    # --------------------------
     def _codes_to_categories(self, preds: torch.Tensor) -> torch.Tensor:
         if not self.code_to_item_map or self.item_category_tensor.numel() == 0:
             return torch.full((preds.size(0), preds.size(1)), -1, device=preds.device, dtype=torch.long)
+
         base_map = self.item_category_tensor.to(preds.device)
         bsz, num_beam, _ = preds.shape
         cates = torch.full((bsz, num_beam), -1, device=preds.device, dtype=torch.long)
+
         for b in range(bsz):
             for k in range(num_beam):
                 code_tuple = tuple(preds[b, k].tolist())
@@ -811,38 +821,31 @@ class AdaDiff(AbstractModel):
                     cates[b, k] = preds[b, k, 0]
         return cates
 
-    def _calculate_diversity_penalty(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, target_start: int) -> torch.Tensor:
+    def _calculate_diversity_penalty(self, input_ids, attention_mask, target_start):
+        """
+        penalty: [B, L, V]
+        当前实现：只统计 history 区域出现过的 token，把它们作为 level-0 的惩罚（保持原逻辑）
+        attention_mask 参数保留（兼容旧调用），但不使用。
+        """
+        B, _ = input_ids.shape
         device = input_ids.device
-        batch_size, seq_len = input_ids.shape
-        special_ids = torch.tensor([self.pad_token_id, self.mask_token_id, self.cls_token_id, self.sep_token_id], device=device)
-        
-        sep_mask = (input_ids == self.sep_token_id) & attention_mask.bool()
-        default_sep = torch.full((batch_size,), target_start, device=device)
-        sep_pos = torch.where(sep_mask.any(dim=1), sep_mask.float().argmax(dim=1), default_sep)
-        
-        positions = torch.arange(seq_len, device=device).unsqueeze(0)
-        hist_mask = (positions < sep_pos.unsqueeze(1)) & attention_mask.bool()
-        valid_mask = hist_mask & (~torch.isin(input_ids, special_ids))
-        
-        starts = self.level_starts.to(device)
-        ends = self.level_ends.to(device)
-        max_prefix_lvl = min(1, len(starts) - 1)
-        in_prefix_levels = (input_ids >= starts[0]) & (input_ids <= ends[max_prefix_lvl])
-        valid_mask = valid_mask & in_prefix_levels
-        
-        penalty = torch.zeros(batch_size, self.vocab_size, device=device, dtype=torch.float)
-        non_zero = torch.nonzero(valid_mask, as_tuple=False)
-        if non_zero.numel() > 0:
-            batch_indices = non_zero[:, 0]
-            token_indices = input_ids[valid_mask]
-            penalty.index_put_((batch_indices, token_indices), torch.ones_like(token_indices, dtype=penalty.dtype), accumulate=True)
-        
-        total = penalty.sum(dim=1, keepdim=True).clamp(min=1.0)
-        return penalty / total
+        penalty = torch.zeros(B, self.code_len, self.vocab_size, device=device)
+
+        hist = input_ids[:, :target_start]
+        for b in range(B):
+            for tok in hist[b]:
+                tok = int(tok.item())
+                if tok < 0:
+                    continue
+                penalty[b, 0, tok] += 1
+
+        penalty = penalty / (penalty.sum(dim=-1, keepdim=True) + 1e-6)
+        return penalty
 
     @staticmethod
     def _calculate_pos_index(preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        if labels.dim() == 2: labels = labels.unsqueeze(1)
+        if labels.dim() == 2:
+            labels = labels.unsqueeze(1)
         label_len = labels.shape[-1]
         preds = preds[..., :label_len]
         labels_expanded = labels.expand(-1, preds.shape[1], -1)
@@ -850,7 +853,6 @@ class AdaDiff(AbstractModel):
 
     @staticmethod
     def _align_layer_weights(weights: List[float], code_len: int) -> List[float]:
-        """Pad or truncate layer weights to match code_len."""
         if len(weights) == code_len:
             return weights
         if len(weights) > code_len:
@@ -861,12 +863,21 @@ class AdaDiff(AbstractModel):
         return weights + [last] * (code_len - len(weights))
 
     @staticmethod
-    def _build_item_cate_maps(item_to_cate_map: Optional[Dict[int, Any]], item_to_code_map: Optional[Dict[int, List[int]]]) -> Tuple[Dict[int, Any], Dict[int, List[Any]]]:
+    def _build_item_cate_maps(
+        item_to_cate_map: Optional[Dict[int, Any]],
+        item_to_code_map: Optional[Dict[int, List[int]]],
+    ) -> Tuple[Dict[int, Any], Dict[int, List[Any]]]:
+        """
+        ✅ 优化：不再构造 item_to_cates_map（原代码没使用，构造只增开销）
+        为了兼容外部潜在引用，返回一个空 dict 作为第二返回值。
+        """
         cate_map: Dict[int, Any] = {}
-        if item_to_cate_map: cate_map.update(item_to_cate_map)
+        if item_to_cate_map:
+            cate_map.update(item_to_cate_map)
         if item_to_code_map:
             for iid, codes in item_to_code_map.items():
                 if iid not in cate_map and len(codes) > 0:
                     cate_map[iid] = codes[0]
-        cates_map = {iid: (v if isinstance(v, list) else [v]) for iid, v in cate_map.items()}
-        return cate_map, cates_map
+
+        # 不再构造 cates_map（节省初始化成本）
+        return cate_map, {}

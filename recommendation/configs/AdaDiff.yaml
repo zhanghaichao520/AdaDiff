@@ -13,35 +13,35 @@ training_params:
   lr: 0.001                      # Optimizer LR
   weight_decay: 0.01               # L2 weight decay
   batch_size: 1024                 # Train batch size
-  num_epochs: 200                  # Max training epochs
+  num_epochs: 50                  # Max training epochs
   early_stop: 3                   # Early stop patience (epochs)
-  eval_interval: 10                 # Eval every N epochs
+  eval_interval: 5                 # Eval every N epochs
   num_workers: 32                  # Dataloader workers
-
-# evaluation_params:
-#   diffusion_steps: 4               # Reverse denoising steps at inference
-#   beam_size: 10                    # Beam width
-#   top_k: 30                       # Sampling top-k (>= beam*2 to avoid auto bump)
-#   temperature: 0.2                 # Sampling temperature
-#   batch_size: 128                  # Eval batch size
-#   lambda_div: 0                  # Diversity penalty for rerank/final logits
-#   lambda_div_sampling: 0       # Base energy guidance scale (annealed over time)
-#   time_anneal_guidance: true       # Use time decay for lambda_div_sampling
-#   use_prefix_trie: true            # Enforce prefix-tree validity
-#   alpha_diversity: 0.5             # Alpha-NDCG weighting
-#   diversity_topk: 0               # Enforce distinct categories in top-k beams (0 to disable)
-#   debug_logit_stats: true         # If true, log logits/guidance stats for scale sanity-check
 
 evaluation_params:
   diffusion_steps: 4               # Reverse denoising steps at inference
-  beam_size: 20                    # Beam width
-  top_k: 50                       # Sampling top-k (>= beam*2 to avoid auto bump)
-  temperature: 0.2                 # Sampling temperature
+  beam_size: 50                    # Beam width
+  top_k: 100                       # Sampling top-k (>= beam*2 to avoid auto bump)
+  temperature: 0.7                 # Sampling temperature
   batch_size: 128                  # Eval batch size
-  lambda_div: 1                  # Diversity penalty for rerank/final logits
-  lambda_div_sampling: 0.04          # Base energy guidance scale (annealed over time)
+  lambda_div: 0                  # Diversity penalty for rerank/final logits
+  lambda_div_sampling: 0       # Base energy guidance scale (annealed over time)
   time_anneal_guidance: true       # Use time decay for lambda_div_sampling
   use_prefix_trie: true            # Enforce prefix-tree validity
   alpha_diversity: 0.5             # Alpha-NDCG weighting
   diversity_topk: 0               # Enforce distinct categories in top-k beams (0 to disable)
   debug_logit_stats: true         # If true, log logits/guidance stats for scale sanity-check
+
+# evaluation_params:
+#   diffusion_steps: 4               # Reverse denoising steps at inference
+#   beam_size: 20                    # Beam width
+#   top_k: 50                       # Sampling top-k (>= beam*2 to avoid auto bump)
+#   temperature: 0.25                 # Sampling temperature
+#   batch_size: 512                  # Eval batch size
+#   lambda_div: 0.1                  # Diversity penalty for rerank/final logits
+#   lambda_div_sampling: 0          # Base energy guidance scale (annealed over time)
+#   time_anneal_guidance: false       # Use time decay for lambda_div_sampling
+#   use_prefix_trie: true            # Enforce prefix-tree validity
+#   alpha_diversity: 0.5             # Alpha-NDCG weighting
+#   diversity_topk: 0               # Enforce distinct categories in top-k beams (0 to disable)
+#   debug_logit_stats: false         # If true, log logits/guidance stats for scale sanity-check

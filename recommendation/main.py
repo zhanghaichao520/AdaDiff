@@ -83,12 +83,23 @@ def main():
     )
     logging.info(f"Item to code map loaded. Total items mapped: {len(item_to_code_map)}")
     dataset_root = Path(config['train_json']).parent
+    # === 修改调用参数 ===
     item_to_cate_map, cate_id_to_name = load_item_category_map(
         dataset_root,
         args.dataset,
         return_cate_names=True,
-        min_items_per_cate=10,
-        max_categories=30,
+        
+        # [修改 1] 允许更小的类别存在
+        # 细粒度切分后，很多类可能只有 3-5 个物品，设置 10 会导致它们被吞并
+        min_items_per_cate=5,  
+        
+        # [修改 2] 彻底解除类别数量上限！！！
+        # 设置为 0 表示不限制。我们需要 100~500 个类别来画曲线
+        max_categories=0,      
+        
+        # [修改 3] 显式传入新参数 (确保你用了新版函数)
+        split_threshold=0.01,   # 1% 就拆分
+        use_composite_keys=True # 使用组合键
     )
     if item_to_cate_map:
         cate_counter = Counter(item_to_cate_map.values())
