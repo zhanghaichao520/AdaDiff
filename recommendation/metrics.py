@@ -144,6 +144,10 @@ def calculate_diversity_at_n(
 
     return float(total_score), valid_users
 
+import math
+import torch
+from typing import Tuple
+
 
 def calculate_alpha_ndcg_at_k(
     candidates: torch.Tensor,
@@ -154,18 +158,13 @@ def calculate_alpha_ndcg_at_k(
     valid_mask: torch.Tensor = None,
 ) -> Tuple[float, int]:
     """
-    Alpha-NDCG@k (Paragon / TREC 定义)
-    考虑信息冗余的排名指标。如果列表中已经出现了某类物品，后续同类物品的增益会衰减。
-    返回「分數總和」和「有效樣本數」。
+    Alpha-NDCG@k (Category-level relevance, compatible version)
 
-    Args:
-        candidates: [B, K_pred] long tensor, 预测的 Item IDs
-        ground_truth: [B, M] long tensor, 真实的 Item IDs (Target)
-        item_category_map: [Vocab_Size] long tensor
-        k: 截断长度
-        alpha: 冗余惩罚系数 (0.5 是标准值)
-        valid_mask: [B, K_pred] bool tensor，True 表示該位置的 item 有效
+    - relevance 定义为「命中 GT category」
+    - 冗余惩罚仍然在 category 级别生效
+    - 完全兼容你现有日志、统计方式和调用代码
     """
+
     if candidates.numel() == 0:
         return 0.0, 0
 
@@ -175,6 +174,7 @@ def calculate_alpha_ndcg_at_k(
     cand_list = candidates.detach().cpu().tolist()
     gt_list = ground_truth.detach().cpu().tolist()
     cat_map = item_category_map.detach().cpu()
+
     if valid_mask is None:
         valid_mask = torch.ones_like(candidates, dtype=torch.bool)
     valid_list = valid_mask.detach().cpu().tolist()
@@ -182,10 +182,11 @@ def calculate_alpha_ndcg_at_k(
     scores = []
 
     for b in range(B):
+        # ---- GT categories ----
         gt_items = [int(x) for x in gt_list[b] if x >= 0]
         if not gt_items:
             continue
-        # Ground truth 類別
+
         gt_cates = [
             int(cat_map[i].item())
             for i in gt_items
@@ -194,6 +195,9 @@ def calculate_alpha_ndcg_at_k(
         if not gt_cates:
             continue
 
+        gt_cate_set = set(gt_cates)
+
+        # ---- candidate list ----
         cand_row = []
         for idx, (itm, is_valid) in enumerate(zip(cand_list[b], valid_list[b])):
             if idx >= eval_k:
@@ -205,26 +209,25 @@ def calculate_alpha_ndcg_at_k(
         if not cand_row:
             continue
 
-        gt_set = set(gt_items)
-
-        # --- A. 計算 DCG ---
+        # ---------- DCG ----------
         dcg = 0.0
         cate_counts = {}
+
         for rank, item_id in enumerate(cand_row, start=1):
-            if item_id not in gt_set:
-                continue
             cate = int(cat_map[item_id].item())
-            if cate < 0:
+            if cate < 0 or cate not in gt_cate_set:
                 continue
+
             gain = (1.0 - alpha) ** cate_counts.get(cate, 0)
             dcg += gain / math.log2(rank + 1)
             cate_counts[cate] = cate_counts.get(cate, 0) + 1
 
-        # --- B. 計算 IDCG（從 GT 類別中貪心挑選） ---
+        # ---------- IDCG ----------
         idcg = 0.0
         ideal_counts = {}
-        candidate_pool = gt_cates[:]
+        candidate_pool = gt_cates[:]  # category-level ideal pool
         ideal_len = min(eval_k, len(candidate_pool))
+
         for rank in range(1, ideal_len + 1):
             best_gain, best_idx = -1.0, -1
             for idx, cate in enumerate(candidate_pool):
@@ -233,8 +236,10 @@ def calculate_alpha_ndcg_at_k(
                 gain = (1.0 - alpha) ** ideal_counts.get(cate, 0)
                 if gain > best_gain:
                     best_gain, best_idx = gain, idx
+
             if best_idx == -1:
                 break
+
             chosen_cate = candidate_pool[best_idx]
             candidate_pool[best_idx] = None
             idcg += best_gain / math.log2(rank + 1)

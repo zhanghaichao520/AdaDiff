@@ -25,8 +25,8 @@ evaluation_params:
   temperature: 0.7                 # Sampling temperature
   batch_size: 128                  # Eval batch size
   lambda_div: 0                  # Diversity penalty for rerank/final logits
-  lambda_div_sampling: 0       # Base energy guidance scale (annealed over time)
-  time_anneal_guidance: true       # Use time decay for lambda_div_sampling
+  lambda_div_sampling: 1       # Base energy guidance scale (annealed over time)
+  time_anneal_guidance: false       # Use time decay for lambda_div_sampling
   use_prefix_trie: true            # Enforce prefix-tree validity
   alpha_diversity: 0.5             # Alpha-NDCG weighting
   diversity_topk: 0               # Enforce distinct categories in top-k beams (0 to disable)
