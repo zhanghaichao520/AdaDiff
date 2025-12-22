@@ -36,11 +36,11 @@ from recommendation.models.generation.prefix_tree import Trie, build_trie_from_c
 def main():
     # === 1. 解析命令列參數 ===
     parser = argparse.ArgumentParser(description="GenRec Universal Training Pipeline")
-    parser.add_argument('--model', type=str,default="AdaDiff", help='模型名稱 (e.g., TIGER, GPT2, RPG)')
+    parser.add_argument('--model', type=str,default="TIGER", help='模型名稱 (e.g., TIGER, GPT2, RPG)')
     parser.add_argument('--dataset', type=str, default="amazon-musical-instruments-23", help='数据集名稱 (e.g., Beauty)')
     parser.add_argument('--quant_method', type=str, default="rqvae", choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq', 'vqvae', 'mm_rqvae'], help='量化方法')
     parser.add_argument('--embedding_modality', type=str, default='text', choices=['text', 'image', 'fused', 'lfused', 'cf'], help='量化模态类型，对应不同的 codebook (默认 text)')
-    parser.add_argument('--eval_only', default=True, help='仅加载已有模型，在测试集上直接评估')
+    parser.add_argument('--eval_only', default=False, help='仅加载已有模型，在测试集上直接评估')
 
     
     # ✅ (已移除) 删除了 --no_trie 命令行参数
