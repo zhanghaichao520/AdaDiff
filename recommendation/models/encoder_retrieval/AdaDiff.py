@@ -82,12 +82,6 @@ class AdaDiff(AbstractModel):
             persistent=False,
         )
 
-        # ✅ 删除未使用的 level_starts/level_ends（原代码未引用）
-        # level_starts = [b + 1 for b in self.bases]
-        # level_ends = [self.bases[i] + self.vocab_sizes[i] for i in range(len(self.vocab_sizes))]
-        # self.register_buffer("level_starts", torch.tensor(level_starts, dtype=torch.long), persistent=False)
-        # self.register_buffer("level_ends", torch.tensor(level_ends, dtype=torch.long), persistent=False)
-
         self.code_to_item_map = code_to_item_map or {}
 
         # ✅ 不再构造 item_to_cates_map（你代码里没用过；保持属性存在避免外部引用报错）

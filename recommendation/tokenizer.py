@@ -295,7 +295,7 @@ def get_tokenizer(model_name: str, config: Dict[str, Any], item_to_code_map: Dic
             'train': AdaDiffTokenizer(config, item_to_code_map, is_training=True),
             'eval': AdaDiffTokenizer(config, item_to_code_map, is_training=False)
         }
-    if model_name == 'TIGER':
+    if model_name in ('TIGER', 'TIGER_MMR'):
         return GenerativeTokenizer(config, item_to_code_map, padding_side='right')
     elif 'GPT2' in model_name or 'LLM' in model_name:
         return GenerativeTokenizer(config, item_to_code_map, padding_side='left')

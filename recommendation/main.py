@@ -37,7 +37,7 @@ def main():
     # === 1. 解析命令列參數 ===
     parser = argparse.ArgumentParser(description="GenRec Universal Training Pipeline")
     parser.add_argument('--model', type=str,default="AdaDiff", help='模型名稱 (e.g., TIGER, GPT2, RPG)')
-    parser.add_argument('--dataset', type=str, default="amazon-musical-instruments-23", help='数据集名稱 (e.g., Beauty)')
+    parser.add_argument('--dataset', type=str, default="amazon-video-games-23", help='数据集名稱 (e.g., Beauty)')
     parser.add_argument('--quant_method', type=str, default="rqvae", choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq', 'vqvae', 'mm_rqvae'], help='量化方法')
     parser.add_argument('--embedding_modality', type=str, default='text', choices=['text', 'image', 'fused', 'lfused', 'cf'], help='量化模态类型，对应不同的 codebook (默认 text)')
     parser.add_argument('--eval_only', default=True, help='仅加载已有模型，在测试集上直接评估')
@@ -88,18 +88,10 @@ def main():
         dataset_root,
         args.dataset,
         return_cate_names=True,
-        
-        # [修改 1] 允许更小的类别存在
-        # 细粒度切分后，很多类可能只有 3-5 个物品，设置 10 会导致它们被吞并
-        min_items_per_cate=5,  
-        
-        # [修改 2] 彻底解除类别数量上限！！！
-        # 设置为 0 表示不限制。我们需要 100~500 个类别来画曲线
-        max_categories=0,      
-        
-        # [修改 3] 显式传入新参数 (确保你用了新版函数)
-        split_threshold=0.01,   # 1% 就拆分
-        use_composite_keys=True # 使用组合键
+        min_items_per_cate=int(config['evaluation_params'].get('diversity_min_items_per_cate', 5)), # 读取配置
+        max_categories=int(config['evaluation_params'].get('diversity_max_categories', 0)),         # 读取配置
+        split_threshold=float(config['evaluation_params'].get('diversity_split_threshold', 0.01)),
+        use_composite_keys=bool(config['evaluation_params'].get('diversity_use_composite_keys', True))
     )
     if item_to_cate_map:
         cate_counter = Counter(item_to_cate_map.values())
@@ -109,9 +101,9 @@ def main():
             name = cate_id_to_name.get(cid, str(cid))
             ratio = (cnt / total) if total else 0
             lines.append(f"{name}: {cnt} ({ratio:.2%})")
-        logging.info("[Diversity] Category distribution:\n" + "\n".join(lines))
+        logging.debug("[Diversity] Category distribution:\n" + "\n".join(lines))
     else:
-        logging.info("[Diversity] Category map is empty; skip distribution logging.")
+        logging.debug("[Diversity] Category map is empty; skip distribution logging.")
 
     # === 6. ✅ (修改) 根据 config 构建前缀树 ===
     prefix_trie: Optional[Trie] = None
@@ -146,7 +138,7 @@ def main():
     # ✅ (修改) 将 config 和 prefix_trie (可能是 None) 传递给模型
     #    (我们假设 ModelClass 的 __init__ 接受 prefix_trie=None)
     model_kwargs = {"prefix_trie": prefix_trie}
-    if args.model.upper() == "ADADIFF":
+    if args.model.upper() == "ADADIFF" or args.model.upper() == "TIGER_MMR":
         model_kwargs.update(
             {
                 "item_to_code_map": item_to_code_map,

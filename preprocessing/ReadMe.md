@@ -16,7 +16,7 @@ python download_data.py --source amazon --dataset Musical_Instruments
 python download_data.py --source movielens --dataset ml-1m
 
 # recbole 数据集
-python download_recbole_data.py --dataset amazon-video-games-23
+python download_recbole_data.py --dataset amazon-musical-instruments-23
 ```
 
 
@@ -46,7 +46,7 @@ python process_data.py --dataset_type amazon --dataset Musical_Instruments
 python process_data.py --dataset_type movielens --dataset ml-1m
 
 # recbole 数据集
-python process_data.py --dataset_type recbole --dataset amazon-video-games-23
+python process_data.py --dataset_type recbole --dataset amazon-musical-instruments-23
 ```
 
 ---
@@ -56,7 +56,7 @@ python process_data.py --dataset_type recbole --dataset amazon-video-games-23
 ### 生成本地 T5 文本嵌入 (PCA 到 512d):
 
 ```bash
-python process_embedding.py  --embedding_type text_local --dataset Musical_Instruments  --model_name_or_path sentence-transformers/sentence-t5-base --pca_dim 512
+python process_embedding.py  --embedding_type text_local --dataset amazon-musical-instruments-23  --model_name_or_path sentence-transformers/sentence-t5-base --pca_dim 512
 ```
 
 ### 生成 OpenAI API 文本嵌入:

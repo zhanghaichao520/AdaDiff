@@ -150,19 +150,21 @@ from typing import Tuple
 
 
 def calculate_alpha_ndcg_at_k(
-    candidates: torch.Tensor,
-    ground_truth: torch.Tensor,
-    item_category_map: torch.Tensor,
+    candidates: torch.Tensor,          # (B, K)
+    ground_truth: torch.Tensor,         # (B, 1) or (B, G)
+    item_category_map: torch.Tensor,    # (num_items,)
     k: int,
     alpha: float = 0.5,
     valid_mask: torch.Tensor = None,
 ) -> Tuple[float, int]:
     """
-    Alpha-NDCG@k (Category-level relevance, compatible version)
+    Alpha-NDCG@K (STRICT, non-inflated version)
 
-    - relevance 定义为「命中 GT category」
-    - 冗余惩罚仍然在 category 级别生效
-    - 完全兼容你现有日志、统计方式和调用代码
+    Key properties:
+    - Relevance is ITEM-level (must hit GT item)
+    - Alpha redundancy penalty is CATEGORY-level
+    - Safe for single-GT-item setting
+    - Alpha-NDCG will be comparable to standard NDCG
     """
 
     if candidates.numel() == 0:
@@ -173,7 +175,7 @@ def calculate_alpha_ndcg_at_k(
 
     cand_list = candidates.detach().cpu().tolist()
     gt_list = ground_truth.detach().cpu().tolist()
-    cat_map = item_category_map.detach().cpu()
+    cate_map = item_category_map.detach().cpu()
 
     if valid_mask is None:
         valid_mask = torch.ones_like(candidates, dtype=torch.bool)
@@ -182,68 +184,74 @@ def calculate_alpha_ndcg_at_k(
     scores = []
 
     for b in range(B):
-        # ---- GT categories ----
-        gt_items = [int(x) for x in gt_list[b] if x >= 0]
+        # -----------------------------
+        # 1. GT items (STRICT)
+        # -----------------------------
+        gt_items = {int(x) for x in gt_list[b] if x >= 0}
         if not gt_items:
             continue
 
-        gt_cates = [
-            int(cat_map[i].item())
+        # GT categories (for redundancy penalty only)
+        gt_cates = {
+            int(cate_map[i].item())
             for i in gt_items
-            if 0 <= i < len(cat_map) and int(cat_map[i].item()) >= 0
-        ]
+            if 0 <= i < len(cate_map) and int(cate_map[i].item()) >= 0
+        }
+
         if not gt_cates:
             continue
 
-        gt_cate_set = set(gt_cates)
-
-        # ---- candidate list ----
+        # -----------------------------
+        # 2. Candidate list
+        # -----------------------------
         cand_row = []
         for idx, (itm, is_valid) in enumerate(zip(cand_list[b], valid_list[b])):
             if idx >= eval_k:
                 break
-            if not is_valid or itm < 0 or itm >= len(cat_map):
+            if not is_valid or itm < 0 or itm >= len(cate_map):
                 continue
             cand_row.append(int(itm))
 
         if not cand_row:
             continue
 
-        # ---------- DCG ----------
+        # -----------------------------
+        # 3. DCG (item-level relevance)
+        # -----------------------------
         dcg = 0.0
         cate_counts = {}
 
         for rank, item_id in enumerate(cand_row, start=1):
-            cate = int(cat_map[item_id].item())
-            if cate < 0 or cate not in gt_cate_set:
+            # ❗ STRICT relevance: must hit GT item
+            if item_id not in gt_items:
                 continue
 
+            cate = int(cate_map[item_id].item())
+            if cate < 0:
+                continue
+
+            # Alpha redundancy penalty by category
             gain = (1.0 - alpha) ** cate_counts.get(cate, 0)
             dcg += gain / math.log2(rank + 1)
             cate_counts[cate] = cate_counts.get(cate, 0) + 1
 
-        # ---------- IDCG ----------
+        # -----------------------------
+        # 4. IDCG (ideal ranking)
+        # -----------------------------
+        # Ideal: GT items ranked at top, category redundancy penalized
         idcg = 0.0
         ideal_counts = {}
-        candidate_pool = gt_cates[:]  # category-level ideal pool
-        ideal_len = min(eval_k, len(candidate_pool))
+
+        ideal_items = list(gt_items)
+        ideal_len = min(eval_k, len(ideal_items))
 
         for rank in range(1, ideal_len + 1):
-            best_gain, best_idx = -1.0, -1
-            for idx, cate in enumerate(candidate_pool):
-                if cate is None:
-                    continue
-                gain = (1.0 - alpha) ** ideal_counts.get(cate, 0)
-                if gain > best_gain:
-                    best_gain, best_idx = gain, idx
+            item_id = ideal_items[rank - 1]
+            cate = int(cate_map[item_id].item())
 
-            if best_idx == -1:
-                break
-
-            chosen_cate = candidate_pool[best_idx]
-            candidate_pool[best_idx] = None
-            idcg += best_gain / math.log2(rank + 1)
-            ideal_counts[chosen_cate] = ideal_counts.get(chosen_cate, 0) + 1
+            gain = (1.0 - alpha) ** ideal_counts.get(cate, 0)
+            idcg += gain / math.log2(rank + 1)
+            ideal_counts[cate] = ideal_counts.get(cate, 0) + 1
 
         if idcg > 0:
             scores.append(dcg / idcg)
