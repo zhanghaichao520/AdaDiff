@@ -119,6 +119,9 @@ class AdaDiff(AbstractModel):
         self.use_time_anneal_guidance = bool(eval_params.get("time_anneal_guidance", True))
         self.debug_logit_stats = bool(eval_params.get("debug_logit_stats", False))
         self.temperature = float(eval_params.get("temperature", 0.3))
+        # ABLATION switch
+        self.disable_auto_scale = bool(eval_params.get("disable_auto_scale", False))
+        self.disable_refinement = bool(eval_params.get("disable_refinement", False))
 
         self.top_k = int(eval_params.get("top_k", eval_params.get("topk_sampling", 10)))
         min_topk = max(self.beam_size * 2, 32)
@@ -318,11 +321,15 @@ class AdaDiff(AbstractModel):
                         penalty_intensity = expanded_penalty[penalty_active_mask].mean()
                     else:
                         penalty_intensity = torch.tensor(1.0, device=device)
+                    
+                    if self.disable_auto_scale:
+                        # w/o Scaling
+                        auto_scale = torch.ones((), device=logits.device)
 
-                    auto_scale = current_logits_std / (penalty_intensity + 1e-9)
-
-                    # 防止 auto_scale 爆炸（你日志里 97x 就是爆炸）
-                    auto_scale = torch.clamp(auto_scale, max=5.0)
+                    else:
+                        auto_scale = current_logits_std / (penalty_intensity + 1e-9)
+                        # 防止 auto_scale 爆炸（你日志里 97x 就是爆炸）
+                        auto_scale = torch.clamp(auto_scale, max=5.0)
 
                     if self.use_time_anneal_guidance and self.num_inference_steps > 1:
                         time_factor = 1.0 - float(step) / float(self.num_inference_steps - 1)
@@ -349,6 +356,8 @@ class AdaDiff(AbstractModel):
                             f"auto_scale={auto_scale.item():.2f} | "
                             f"t_index={t_index_val}"
                         )
+                        logger.info(f"self.disable_refinement: {self.disable_refinement}")
+                        logger.info(f"self.disable_auto_scale: {self.disable_auto_scale}")
                         self._logged_sampling_stats = True
 
             # 3) Sampling
@@ -365,49 +374,52 @@ class AdaDiff(AbstractModel):
             sampled = torch.multinomial(probs.view(-1, self.top_k), num_samples=1).view(-1, target_len, 1)
             sampled_tokens = topk_ids.gather(-1, sampled).squeeze(-1)
 
-            # 4) Confidence-based remasking
-            conf_logits = guided_logits[:, target_start:, :].masked_fill(~self.level_token_mask, mask_value)
-            if self.prefix_trie is not None and prefix_lens is not None and allowed_next_tensor is not None:
-                dead_beam_mask |= self._mask_logits_with_trie(conf_logits, allowed_next_tensor, prefix_lens, mask_value)
-
-            target_conf = torch.softmax(conf_logits, dim=-1).max(dim=-1).values
-
-            if step == self.num_inference_steps - 1:
-                threshold = 0.0
+            if self.disable_refinement:
+                expanded_ids[:, target_start:] = sampled_tokens
             else:
-                threshold = 0.1 + 0.6 * (step / (self.num_inference_steps - 1))
-            confident = target_conf > threshold
+                # 4) Confidence-based remasking
+                conf_logits = guided_logits[:, target_start:, :].masked_fill(~self.level_token_mask, mask_value)
+                if self.prefix_trie is not None and prefix_lens is not None and allowed_next_tensor is not None:
+                    dead_beam_mask |= self._mask_logits_with_trie(conf_logits, allowed_next_tensor, prefix_lens, mask_value)
 
-            if self.prefix_trie is not None and dead_beam_mask.any():
-                confident = confident & (~dead_beam_mask.unsqueeze(1))
+                target_conf = torch.softmax(conf_logits, dim=-1).max(dim=-1).values
 
-            # Ensure at least one position is confident per beam (keep prefix_len pos)
-            confident_view = confident.view(batch_size, self.beam_size, target_len)
-            prefix_lens_view = prefix_lens.view(batch_size, self.beam_size) if prefix_lens is not None else None
-            for b in range(batch_size):
-                for k in range(self.beam_size):
-                    pos = int(prefix_lens_view[b, k].item()) if prefix_lens_view is not None else 0
-                    pos = min(pos, target_len - 1)
-                    confident_view[b, k, pos] = True
+                if step == self.num_inference_steps - 1:
+                    threshold = 0.0
+                else:
+                    threshold = 0.1 + 0.6 * (step / (self.num_inference_steps - 1))
+                confident = target_conf > threshold
 
-            no_conf_mask = ~confident_view.any(dim=2)
-            if no_conf_mask.any():
-                confident_view[no_conf_mask, 0] = True
-            confident = confident_view.view(batch_size * self.beam_size, target_len)
+                if self.prefix_trie is not None and dead_beam_mask.any():
+                    confident = confident & (~dead_beam_mask.unsqueeze(1))
 
-            # remask/update
-            if self.prefix_trie is not None:
-                new_target = self._remask_with_trie(
-                    sampled_tokens=sampled_tokens,
-                    confident=confident,
-                    current_target=current_target,
-                    prefix_lens=prefix_lens,
-                    inactive_mask=dead_beam_mask,
-                )
-            else:
-                new_target = torch.where(confident, sampled_tokens, torch.full_like(sampled_tokens, self.mask_token_id))
+                # Ensure at least one position is confident per beam (keep prefix_len pos)
+                confident_view = confident.view(batch_size, self.beam_size, target_len)
+                prefix_lens_view = prefix_lens.view(batch_size, self.beam_size) if prefix_lens is not None else None
+                for b in range(batch_size):
+                    for k in range(self.beam_size):
+                        pos = int(prefix_lens_view[b, k].item()) if prefix_lens_view is not None else 0
+                        pos = min(pos, target_len - 1)
+                        confident_view[b, k, pos] = True
 
-            expanded_ids[:, target_start:] = new_target
+                no_conf_mask = ~confident_view.any(dim=2)
+                if no_conf_mask.any():
+                    confident_view[no_conf_mask, 0] = True
+                confident = confident_view.view(batch_size * self.beam_size, target_len)
+
+                # remask/update
+                if self.prefix_trie is not None:
+                    new_target = self._remask_with_trie(
+                        sampled_tokens=sampled_tokens,
+                        confident=confident,
+                        current_target=current_target,
+                        prefix_lens=prefix_lens,
+                        inactive_mask=dead_beam_mask,
+                    )
+                else:
+                    new_target = torch.where(confident, sampled_tokens, torch.full_like(sampled_tokens, self.mask_token_id))
+
+                expanded_ids[:, target_start:] = new_target
 
         # 5) Final scoring (keep 3D logits for trie decode)
         t_index_val = int(max(self.training_diffusion_steps - 1, 0))
@@ -624,6 +636,16 @@ class AdaDiff(AbstractModel):
                     metrics[f"SCD@{top_beams}"] = scd_sum
                     metrics[f"WSCD@{top_beams}"] = wscd_sum
                     metrics[f"_valid_SCD@{top_beams}"] = scd_cnt
+
+        # ---- Validity@10 (Val) ----
+        K_val = 10
+        topk_val = min(K_val, self.beam_size)
+
+        # invalid_mask: [B, beam_size] True means invalid
+        valid_topk = (~invalid_mask[:, :topk_val]).float()  # [B, topk_val]
+        val_sum = valid_topk.sum().item()
+        metrics[f"Val@{topk_val}"] = val_sum
+        metrics[f"_valid_Val@{topk_val}"] = valid_topk.numel()  # denominator count
 
         return metrics
 

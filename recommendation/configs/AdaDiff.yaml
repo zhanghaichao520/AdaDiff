@@ -19,19 +19,20 @@ training_params:
   num_workers: 32                  # Dataloader workers
 
 evaluation_params:
-  diffusion_steps: 6               # Reverse denoising steps at inference
+  diffusion_steps: 8               # Reverse denoising steps at inference
   beam_size: 50                    # Beam width
   top_k: 100                       # Sampling top-k (>= beam*2 to avoid auto bump)
   temperature: 0.8                 # Sampling temperature
   batch_size: 128                  # Eval batch size
   lambda_div: 0                  # Diversity penalty for rerank/final logits
-  lambda_div_sampling: 28       # Base energy guidance scale (annealed over time)
-  time_anneal_guidance: false       # Use time decay for lambda_div_sampling
+  lambda_div_sampling: 4       # Base energy guidance scale (annealed over time)
+  time_anneal_guidance: true       # Use time decay for lambda_div_sampling
   use_prefix_trie: true            # Enforce prefix-tree validity
   alpha_diversity: 0.5             # Alpha-NDCG weighting
   diversity_topk: 0               # Enforce distinct categories in top-k beams (0 to disable)
   debug_logit_stats: true         # If true, log logits/guidance stats for scale sanity-check
-
+  disable_auto_scale: false
+  disable_refinement: false
 # evaluation_params:
 #   diffusion_steps: 6               # Reverse denoising steps at inference
 #   beam_size: 50                    # Beam width

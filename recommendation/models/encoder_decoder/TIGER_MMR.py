@@ -1,5 +1,4 @@
-# models/TIGER.py (遵守新契约 + MMR 连续可控版)
-
+# models/TIGER.py  (可直接替换：让 Recall 掉得更快，同时让 Diversity 涨得更慢/更平滑)
 from typing import Any, Dict, List, Optional, Tuple
 import math
 import torch
@@ -51,7 +50,6 @@ class TIGER_MMR(AbstractModel):
         self.t5.resize_token_embeddings(config["token_params"]["vocab_size"])
         self.n_params_str = self._calculate_n_parameters()
 
-        # Prefix trie
         self.prefix_trie_fn = None
         if prefix_trie is not None:
             self.prefix_trie_fn = prefix_trie.get_allowed_next_tokens
@@ -62,19 +60,14 @@ class TIGER_MMR(AbstractModel):
         eval_params = config.get("evaluation_params", {})
         self.use_mmr = bool(eval_params.get("use_mmr", False))
         self.alpha_diversity = float(eval_params.get("alpha_diversity", 0.5))
-        if self.use_mmr:
-            logger.info("TIGER MMR 模型 use_mmr 已开启")
 
-        # maps
         self.code_to_item_map = code_to_item_map or {}
 
-        # cate maps
         self.item_to_cate_map, self.item_to_cates_map = self._build_item_cate_maps(
             item_to_cate_map, item_to_code_map
         )
         self.num_semantic_categories = len(set(self.item_to_cate_map.values())) if self.item_to_cate_map else 0
 
-        # category tensor (0-based item id)
         max_item_id = max(self.item_to_cate_map.keys()) if self.item_to_cate_map else 0
         cate_tensor = torch.full((max_item_id + 1,), -1, dtype=torch.long)
         for iid, cate in self.item_to_cate_map.items():
@@ -82,7 +75,6 @@ class TIGER_MMR(AbstractModel):
                 cate_tensor[iid] = int(cate)
         self.register_buffer("item_category_tensor", cate_tensor, persistent=False)
 
-    # ---------------- Basic Properties ----------------
     @property
     def task_type(self) -> str:
         return "generative"
@@ -101,7 +93,6 @@ class TIGER_MMR(AbstractModel):
             f"# Total trainable parameters: {total_params:,}\n"
         )
 
-    # ---------------- Contract Methods ----------------
     def forward(self, batch: Dict) -> Dict:
         t5_known_args = {"input_ids", "attention_mask", "labels"}
         t5_inputs = {k: v for k, v in batch.items() if k in t5_known_args}
@@ -112,13 +103,46 @@ class TIGER_MMR(AbstractModel):
             kwargs.setdefault("prefix_allowed_tokens_fn", self.prefix_trie_fn)
         return self.t5.generate(**kwargs)
 
-    # ---------------- Evaluation ----------------
     def evaluate_step(self, batch: Dict[str, torch.Tensor], topk_list: List[int]) -> Dict[str, float]:
         eval_cfg = self.config.get("evaluation_params", {})
         beam_size = int(eval_cfg["beam_size"])
         code_len = self.config["code_len"]
+
         use_mmr = bool(eval_cfg.get("use_mmr", False))
         mmr_lambda = float(eval_cfg.get("mmr_lambda", 1.0))
+        mmr_lambda_power = float(eval_cfg.get("mmr_lambda_power", 1.0))
+        mmr_pool_size = int(eval_cfg.get("mmr_pool_size", beam_size))
+
+        # 让 Diversity 涨得慢：div_w 在高 lambda 区间更小（power 更大）
+        mmr_penalty_scale = float(eval_cfg.get("mmr_penalty_scale", 0.8))
+        mmr_penalty_power = float(eval_cfg.get("mmr_penalty_power", 2.0))
+        mmr_penalty_weight_power = float(eval_cfg.get("mmr_penalty_weight_power", 2.5))
+
+        # 让 Recall 掉得快：对“高相关”做抑制（影响第1个位置，能把 GT 直接挤出 top10）
+        mmr_rel_suppress_scale = float(eval_cfg.get("mmr_rel_suppress_scale", 1.5))
+        mmr_rel_suppress_power = float(eval_cfg.get("mmr_rel_suppress_power", 2.0))
+        mmr_rel_suppress_weight_power = float(eval_cfg.get("mmr_rel_suppress_weight_power", 0.3))
+
+        # 可选：额外把选择往更深的候选推（轻量）
+        mmr_rank_penalty_scale = float(eval_cfg.get("mmr_rank_penalty_scale", 0.2))
+        mmr_rank_penalty_weight_power = float(eval_cfg.get("mmr_rank_penalty_weight_power", 0.6))
+
+        # 硬约束只在很低 lambda 才启用，避免 diversity 平台跳变
+        mmr_max_per_cate_min = int(eval_cfg.get("mmr_max_per_cate_min", 0))
+        mmr_max_per_cate_max = int(eval_cfg.get("mmr_max_per_cate_max", 0))
+        mmr_diverse_k = int(eval_cfg.get("mmr_diverse_k", 0))
+        mmr_cap_lambda_threshold = float(eval_cfg.get("mmr_cap_lambda_threshold", 0.2))
+
+        # 其他
+        mmr_cate_popularity_scale = float(eval_cfg.get("mmr_cate_popularity_scale", 0.0))
+        mmr_cate_popularity_power = float(eval_cfg.get("mmr_cate_popularity_power", 1.0))
+        mmr_rank_norm = bool(eval_cfg.get("mmr_rank_norm", False))
+        mmr_tie_break_by_score = bool(eval_cfg.get("mmr_tie_break_by_score", False))
+
+        if mmr_lambda_power != 1.0:
+            mmr_lambda = float(max(0.0, min(1.0, mmr_lambda ** mmr_lambda_power)))
+        else:
+            mmr_lambda = float(max(0.0, min(1.0, mmr_lambda)))
 
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
@@ -126,25 +150,30 @@ class TIGER_MMR(AbstractModel):
         device = input_ids.device
         batch_size = input_ids.size(0)
 
-        # 1) generation (need sequence scores)
+        cand_size = max(beam_size, mmr_pool_size) if use_mmr else beam_size
+
         with torch.no_grad():
             gen_out = self.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                num_beams=beam_size,
-                num_return_sequences=beam_size,
+                num_beams=cand_size,
+                num_return_sequences=cand_size,
                 max_new_tokens=code_len,
                 early_stopping=False,
                 output_scores=True,
                 return_dict_in_generate=True,
             )
 
-        raw_seqs = gen_out.sequences.view(batch_size, beam_size, -1)
-        preds_codes = raw_seqs[:, :, 1 : 1 + code_len]               # (B, Beam, L)
-        beam_scores = gen_out.sequences_scores.view(batch_size, beam_size)  # (B, Beam)
+        raw_seqs = gen_out.sequences.view(batch_size, cand_size, -1)
+        preds_codes = raw_seqs[:, :, 1 : 1 + code_len]
+        beam_scores = gen_out.sequences_scores.view(batch_size, cand_size)
 
-        # 2) rerank pool size = max(topk_list)
         eval_max_k = max(topk_list)
+
+        effective_max_per_cate = 0
+        if mmr_max_per_cate_min > 0:
+            max_cap = mmr_max_per_cate_max if mmr_max_per_cate_max > 0 else eval_max_k
+            effective_max_per_cate = int(max(1, min(max_cap, mmr_max_per_cate_min)))
 
         if use_mmr:
             preds_codes, rerank_items, rerank_cates = self.apply_mmr_to_preds_codes(
@@ -154,14 +183,28 @@ class TIGER_MMR(AbstractModel):
                 item_category_tensor=self.item_category_tensor,
                 top_k=eval_max_k,
                 lambda_=mmr_lambda,
+                penalty_scale=mmr_penalty_scale,
+                penalty_power=mmr_penalty_power,
+                penalty_weight_power=mmr_penalty_weight_power,
+                rel_suppress_scale=mmr_rel_suppress_scale,
+                rel_suppress_power=mmr_rel_suppress_power,
+                rel_suppress_weight_power=mmr_rel_suppress_weight_power,
+                rank_penalty_scale=mmr_rank_penalty_scale,
+                rank_penalty_weight_power=mmr_rank_penalty_weight_power,
+                cate_popularity_scale=mmr_cate_popularity_scale,
+                cate_popularity_power=mmr_cate_popularity_power,
+                rank_norm=mmr_rank_norm,
+                tie_break_by_score=mmr_tie_break_by_score,
+                max_per_cate=effective_max_per_cate,
+                diverse_k=mmr_diverse_k,
+                cap_lambda_threshold=mmr_cap_lambda_threshold,
             )
         else:
             preds_codes = preds_codes[:, :eval_max_k]
             rerank_items, rerank_cates = None, None
 
-        K = preds_codes.size(1)  # should be eval_max_k
+        K = preds_codes.size(1)
 
-        # 3) accuracy metrics
         pos_index = self._calculate_pos_index(preds_codes, labels, maxk=K).to(device)
 
         batch_metrics: Dict[str, float] = {"count": float(batch_size)}
@@ -170,12 +213,10 @@ class TIGER_MMR(AbstractModel):
                 batch_metrics[f"Recall@{k}"] = recall_at_k(pos_index[:, :k], k).sum().item()
                 batch_metrics[f"NDCG@{k}"] = ndcg_at_k(pos_index[:, :k], k).sum().item()
 
-        # 4) diversity metrics (0-based item ids)
         if self.code_to_item_map and self.item_category_tensor.numel() > 0:
             metric_k = min(10, K)
             cate_map = self.item_category_tensor.to(device)
 
-            # items: prefer rerank_items (fast path)
             if rerank_items is None:
                 rerank_items = torch.full((batch_size, K), -1, device=device, dtype=torch.long)
                 for b in range(batch_size):
@@ -190,7 +231,6 @@ class TIGER_MMR(AbstractModel):
             batch_metrics[f"Diversity@{metric_k}"] = div_sum
             batch_metrics[f"_valid_Diversity@{metric_k}"] = div_cnt
 
-            # GT items for alpha-ndcg (strict, no inflation)
             gt_items = torch.full((batch_size, 1), -1, device=device, dtype=torch.long)
             for b in range(batch_size):
                 gt_code = tuple(int(x) for x in labels[b].tolist())
@@ -209,7 +249,6 @@ class TIGER_MMR(AbstractModel):
             batch_metrics[f"AlphaNDCG@{metric_k}"] = alpha_sum
             batch_metrics[f"_valid_AlphaNDCG@{metric_k}"] = alpha_cnt
 
-            # SCD / WSCD
             if self.num_semantic_categories > 0 and self.item_to_cate_map:
                 scd_sum, wscd_sum, scd_cnt = 0.0, 0.0, 0
                 for b in range(batch_size):
@@ -229,7 +268,6 @@ class TIGER_MMR(AbstractModel):
 
         return batch_metrics
 
-    # ---------------- TIGER Helper ----------------
     @staticmethod
     def _calculate_pos_index(preds: torch.Tensor, labels: torch.Tensor, maxk: int) -> torch.Tensor:
         preds = preds.detach().cpu()
@@ -258,79 +296,154 @@ class TIGER_MMR(AbstractModel):
                     break
         return pos_index
 
-    # =========================================================
-    # ✅ 连续可控 MMR：把惩罚从 0/1 改为 “按已选同类频次的连续惩罚”
-    # =========================================================
     @staticmethod
     @torch.no_grad()
-    def mmr_rerank_category_continuous(
+    def mmr_rerank(
         beam_item_ids: torch.Tensor,           # (B, Beam)
         beam_scores: torch.Tensor,             # (B, Beam)
         item_category_tensor: torch.Tensor,    # (N,)
         top_k: int,
         lambda_: float,
-        invalid_cate_id: int = -1,
-        tie_break_by_score: bool = True,
-        penalty_power: float = 1.0,
-    ):
-        """
-        Continuous category-aware MMR:
-        - relevance: normalized to [0,1]
-        - redundancy penalty: freq(selected_same_category)/k  (continuous in [0,1])
-          optionally raise to penalty_power to control curvature.
 
-        This fixes the "lambda becomes a switch" problem.
-        """
-        assert 0.0 <= float(lambda_) <= 1.0, "lambda_ must be in [0,1]"
+        penalty_scale: float,
+        penalty_power: float,
+        penalty_weight_power: float,
+
+        rel_suppress_scale: float,
+        rel_suppress_power: float,
+        rel_suppress_weight_power: float,
+
+        rank_penalty_scale: float,
+        rank_penalty_weight_power: float,
+
+        cate_popularity_scale: float,
+        cate_popularity_power: float,
+
+        rank_norm: bool,
+        tie_break_by_score: bool,
+
+        max_per_cate: int,
+        diverse_k: int,
+        cap_lambda_threshold: float,
+
+        invalid_cate_id: int = -1,
+    ):
+        lambda_ = float(max(0.0, min(1.0, lambda_)))
         B, Beam = beam_item_ids.shape
         device = beam_item_ids.device
         cate_map = item_category_tensor.to(device)
 
         valid_item = (beam_item_ids >= 0) & (beam_item_ids < cate_map.numel())
-
         beam_cates = torch.full_like(beam_item_ids, invalid_cate_id)
         beam_cates[valid_item] = cate_map[beam_item_ids[valid_item]]
 
-        # normalize relevance to [0,1]
+        # relevance normalize to [0,1]
         min_s = beam_scores.min(dim=1, keepdim=True).values
         max_s = beam_scores.max(dim=1, keepdim=True).values
         rel = (beam_scores - min_s) / (max_s - min_s + 1e-12)
+
+        def rank_normalize(values: torch.Tensor, mask: torch.Tensor, descending: bool = True) -> torch.Tensor:
+            out = torch.zeros_like(values)
+            idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            if idx.numel() == 0:
+                return out
+            if idx.numel() == 1:
+                out[idx] = 1.0
+                return out
+            vals = values[idx]
+            order = torch.argsort(vals, descending=descending)
+            ranks = torch.linspace(1.0, 0.0, steps=idx.numel(), device=values.device)
+            out[idx[order]] = ranks
+            return out
+
+        # weights
+        div_w = (1.0 - lambda_) ** float(max(1e-8, penalty_weight_power))
+        # 这个项是让 Recall 快速下降的关键（对高 rel 直接惩罚，作用于 t=0）
+        relsup_w = float(rel_suppress_scale) * ((1.0 - lambda_) ** float(max(1e-8, rel_suppress_weight_power)))
+        rank_w = float(rank_penalty_scale) * ((1.0 - lambda_) ** float(max(1e-8, rank_penalty_weight_power)))
 
         reranked_indices = torch.full((B, top_k), 0, device=device, dtype=torch.long)
         NEG_INF = -1e9
 
         for b in range(B):
             remaining = valid_item[b].clone()
-            selected_counts: Dict[int, int] = {}  # cate -> count
+            selected_counts: Dict[int, int] = {}
+            cates_b = beam_cates[b]
+            rel_b = rel[b]
+
+            # rank penalty: top 也有惩罚（避免 top1 永远被选中）
+            order = torch.argsort(rel_b, descending=True)
+            rank_pos = torch.empty((Beam,), device=device, dtype=torch.float)
+            rank_pos[order] = torch.arange(Beam, device=device, dtype=torch.float)
+            rank_pen = (rank_pos + 1.0) / float(max(1, Beam))   # in (0,1]
+
+            # popularity penalty (optional)
+            valid_cate_mask = (cates_b >= 0) & remaining
+            if cate_popularity_scale > 0.0 and valid_cate_mask.any():
+                valid_cates = cates_b[valid_cate_mask]
+                max_cate = int(valid_cates.max().item())
+                counts = torch.bincount(valid_cates, minlength=max_cate + 1).float()
+                pop_pen = torch.zeros((Beam,), device=device)
+                pop_pen[valid_cate_mask] = counts[cates_b[valid_cate_mask]] / float(valid_cates.numel())
+                if cate_popularity_power != 1.0:
+                    pop_pen = pop_pen.clamp(0.0, 1.0).pow(float(cate_popularity_power))
+            else:
+                pop_pen = torch.zeros((Beam,), device=device)
+
+            if rank_norm:
+                rel_b = rank_normalize(rel_b, remaining, descending=True)
+                rank_pen = rank_normalize(rank_pen, remaining, descending=False)
 
             for t in range(top_k):
                 if not remaining.any():
                     reranked_indices[b, t] = reranked_indices[b, t - 1] if t > 0 else 0
                     continue
 
-                # continuous redundancy penalty in [0,1]
-                cates_b = beam_cates[b]  # (Beam,)
-                pen = torch.zeros((Beam,), device=device)
+                # category redundancy penalty
+                div_pen = torch.zeros((Beam,), device=device)
+                if div_w > 0.0 and selected_counts:
+                    for cate, cnt in selected_counts.items():
+                        if cate < 0:
+                            continue
+                        mask = (cates_b == cate)
+                        if not mask.any():
+                            continue
+                        x = (float(cnt) ** float(penalty_power))
+                        pen_val = 1.0 - math.exp(-float(penalty_scale) * x)  # [0,1)
+                        div_pen[mask] = torch.maximum(div_pen[mask], torch.tensor(pen_val, device=device))
 
-                # current step denominator: t+1 keeps penalty scale stable across steps
-                denom = float(max(1, t + 1))
+                total_pen = div_pen
+                if cate_popularity_scale > 0.0:
+                    total_pen = total_pen + float(cate_popularity_scale) * pop_pen
 
-                # fill penalty using counts dict (only for valid cate)
-                # vectorized-ish: loop over unique selected categories (small)
-                for cate, cnt in selected_counts.items():
-                    if cate < 0:
-                        continue
-                    mask = (cates_b == cate)
-                    pen[mask] = max(pen[mask].max().item(), cnt / denom)  # overwrite with same value
+                allowed_mask = remaining
 
-                if penalty_power != 1.0:
-                    pen = pen.clamp(0.0, 1.0).pow(float(penalty_power))
+                # hard cap only when lambda very small
+                cap_enabled = (lambda_ < float(cap_lambda_threshold))
+                cap_active = cap_enabled and (max_per_cate > 0) and (diverse_k <= 0 or t < diverse_k)
+                if cap_active and selected_counts:
+                    cap_mask = torch.zeros((Beam,), device=device, dtype=torch.bool)
+                    for cate, cnt in selected_counts.items():
+                        if cate < 0:
+                            continue
+                        if cnt >= max_per_cate:
+                            cap_mask = cap_mask | (cates_b == cate)
+                    if cap_mask.any():
+                        masked = remaining & ~cap_mask
+                        if masked.any():
+                            allowed_mask = masked
 
-                mmr_score = lambda_ * rel[b] - (1.0 - lambda_) * pen
-                mmr_score[~remaining] = NEG_INF
+                if rank_norm:
+                    total_pen = rank_normalize(total_pen, allowed_mask, descending=True)
+
+                # relevance suppression penalty (t=0 就生效，能显著拉低 Recall)
+                rel_suppress = rel_b.clamp(0.0, 1.0).pow(float(rel_suppress_power))
+
+                mmr_score = (lambda_ * rel_b) - (div_w * total_pen) - (rank_w * rank_pen) - (relsup_w * rel_suppress)
+                mmr_score[~allowed_mask] = NEG_INF
 
                 if tie_break_by_score:
-                    mmr_score = mmr_score + 1e-6 * rel[b]
+                    mmr_score = mmr_score + 1e-6 * rel_b
 
                 idx = int(torch.argmax(mmr_score).item())
                 reranked_indices[b, t] = idx
@@ -347,12 +460,33 @@ class TIGER_MMR(AbstractModel):
     @staticmethod
     @torch.no_grad()
     def apply_mmr_to_preds_codes(
-        preds_codes: torch.Tensor,             # (B, Beam, L)
-        beam_scores: torch.Tensor,             # (B, Beam)
+        preds_codes: torch.Tensor,
+        beam_scores: torch.Tensor,
         code_to_item_map: dict,
         item_category_tensor: torch.Tensor,
         top_k: int,
         lambda_: float,
+
+        penalty_scale: float,
+        penalty_power: float,
+        penalty_weight_power: float,
+
+        rel_suppress_scale: float,
+        rel_suppress_power: float,
+        rel_suppress_weight_power: float,
+
+        rank_penalty_scale: float,
+        rank_penalty_weight_power: float,
+
+        cate_popularity_scale: float,
+        cate_popularity_power: float,
+
+        rank_norm: bool,
+        tie_break_by_score: bool,
+
+        max_per_cate: int,
+        diverse_k: int,
+        cap_lambda_threshold: float,
     ):
         B, Beam, L = preds_codes.shape
         device = preds_codes.device
@@ -364,15 +498,27 @@ class TIGER_MMR(AbstractModel):
                 key = tuple(int(x) for x in codes_cpu[b, i].tolist())
                 beam_item_ids[b, i] = int(code_to_item_map.get(key, -1))
 
-        # ✅ 使用“连续惩罚”版本，保证 lambda 0~1 连续生效
-        rerank_idx, rerank_items, rerank_cates = TIGER_MMR.mmr_rerank_category_continuous(
+        rerank_idx, rerank_items, rerank_cates = TIGER_MMR.mmr_rerank(
             beam_item_ids=beam_item_ids,
             beam_scores=beam_scores,
             item_category_tensor=item_category_tensor,
             top_k=top_k,
             lambda_=lambda_,
-            tie_break_by_score=True,
-            penalty_power=1.0,
+            penalty_scale=penalty_scale,
+            penalty_power=penalty_power,
+            penalty_weight_power=penalty_weight_power,
+            rel_suppress_scale=rel_suppress_scale,
+            rel_suppress_power=rel_suppress_power,
+            rel_suppress_weight_power=rel_suppress_weight_power,
+            rank_penalty_scale=rank_penalty_scale,
+            rank_penalty_weight_power=rank_penalty_weight_power,
+            cate_popularity_scale=cate_popularity_scale,
+            cate_popularity_power=cate_popularity_power,
+            rank_norm=rank_norm,
+            tie_break_by_score=tie_break_by_score,
+            max_per_cate=max_per_cate,
+            diverse_k=diverse_k,
+            cap_lambda_threshold=cap_lambda_threshold,
         )
 
         idx_expanded = rerank_idx.unsqueeze(-1).expand(-1, -1, L)
@@ -392,5 +538,3 @@ class TIGER_MMR(AbstractModel):
                 if iid not in cate_map and len(codes) > 0:
                     cate_map[iid] = codes[0]
         return cate_map, {}
-
-

@@ -181,6 +181,7 @@ def main():
     logging.info("Creating Datasets...")
     if eval_only:
         test_dataset = GenRecDataset(config=config, mode='test')
+        print(f"test_dataset len : {len(test_dataset)}")
     else:
         train_dataset = GenRecDataset(config=config, mode='train')
         validation_dataset = GenRecDataset(config=config, mode='valid')
@@ -249,6 +250,7 @@ def main():
             device
         )
         logging.info(f"[Eval-Only] Test Results: {test_results}")
+        
         return
 
     # === 11. (顺序调整) 训练-评估循环 (已修改) ===
