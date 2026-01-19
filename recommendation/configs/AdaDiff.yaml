@@ -19,7 +19,7 @@ training_params:
   num_workers: 32                  # Dataloader workers
 
 evaluation_params:
-  diffusion_steps: 8               # Reverse denoising steps at inference
+  diffusion_steps: 4               # Reverse denoising steps at inference
   beam_size: 50                    # Beam width
   top_k: 100                       # Sampling top-k (>= beam*2 to avoid auto bump)
   temperature: 0.8                 # Sampling temperature
