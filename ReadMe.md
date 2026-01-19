@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>AdaDiff: Controllable Generative Recommendation via Adaptive Semantic Guidance in Discrete Diffusion</h1>
+  <h1>ReGen: Controllable Generative Recommendation via Adaptive Semantic Guidance in Discrete Diffusion</h1>
 </div>
 
 ---
@@ -67,7 +67,7 @@ Train a generative recommender using the generated SIDs.
 cd recommendation
 
 python main.py \
-  --model AdaDiff \
+  --model ReGen \
   --dataset amazon-musical-instruments-23 \
   --quant_method rqvae
 ```

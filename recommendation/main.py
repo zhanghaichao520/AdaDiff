@@ -36,7 +36,7 @@ from recommendation.models.generation.prefix_tree import Trie, build_trie_from_c
 def main():
     # === 1. 解析命令列參數 ===
     parser = argparse.ArgumentParser(description="GenRec Universal Training Pipeline")
-    parser.add_argument('--model', type=str,default="AdaDiff", help='模型名稱 (e.g., TIGER, GPT2, RPG)')
+    parser.add_argument('--model', type=str,default="ReGen", help='模型名稱 (e.g., TIGER, GPT2, RPG)')
     parser.add_argument('--dataset', type=str, default="amazon-video-games-23", help='数据集名稱 (e.g., Beauty)')
     parser.add_argument('--quant_method', type=str, default="rqvae", choices=['rkmeans', 'rvq', 'rqvae', 'opq', 'pq', 'vqvae', 'mm_rqvae'], help='量化方法')
     parser.add_argument('--embedding_modality', type=str, default='text', choices=['text', 'image', 'fused', 'lfused', 'cf'], help='量化模态类型，对应不同的 codebook (默认 text)')
@@ -138,7 +138,7 @@ def main():
     # ✅ (修改) 将 config 和 prefix_trie (可能是 None) 传递给模型
     #    (我们假设 ModelClass 的 __init__ 接受 prefix_trie=None)
     model_kwargs = {"prefix_trie": prefix_trie}
-    if args.model.upper() == "ADADIFF" or args.model.upper() == "TIGER_MMR":
+    if args.model.upper() == "ReGen" or args.model.upper() == "TIGER_MMR":
         model_kwargs.update(
             {
                 "item_to_code_map": item_to_code_map,

@@ -65,9 +65,9 @@ class BaseTokenizer:
             raise ValueError(f"不支持的 padding_side: {padding_side}")
 
 
-class AdaDiffTokenizer(BaseTokenizer):
+class ReGenTokenizer(BaseTokenizer):
     """
-    為 AdaDiff 構造輸入，強制左填充並支持訓練/評估兩種掩碼策略。
+    為 ReGen， 構造輸入，強制左填充並支持訓練/評估兩種掩碼策略。
     """
 
     def __init__(self, config: Dict[str, Any], item_to_code_map: Dict[int, List[int]], is_training: bool):
@@ -290,10 +290,10 @@ def get_tokenizer(model_name: str, config: Dict[str, Any], item_to_code_map: Dic
     (保持之前的版本不變)
     """
     model_name = model_name.upper()
-    if model_name == 'ADADIFF':
+    if model_name == 'REGEN':
         return {
-            'train': AdaDiffTokenizer(config, item_to_code_map, is_training=True),
-            'eval': AdaDiffTokenizer(config, item_to_code_map, is_training=False)
+            'train': ReGenTokenizer(config, item_to_code_map, is_training=True),
+            'eval': ReGenTokenizer(config, item_to_code_map, is_training=False)
         }
     if model_name in ('TIGER', 'TIGER_MMR'):
         return GenerativeTokenizer(config, item_to_code_map, padding_side='right')
